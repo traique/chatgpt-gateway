@@ -2,6 +2,8 @@
 
 Cloudflare Worker gateway cho ChatGPT/Codex upstream, cung cấp API tương thích OpenAI và giao diện quản trị mobile-first.
 
+> **Lưu ý:** ChatGPT/Codex authentication và backend endpoint được thiết kế cho Codex và có thể thay đổi. Gateway không phải OpenAI Public API.
+
 ## Chức năng
 
 - Chat / Responses API / SSE streaming
@@ -28,7 +30,7 @@ Admin username + password
 HttpOnly session cookie
   ↓
 Cloudflare Worker
-  ├── ChatGPT login
+  ├── ChatGPT device login
   ├── Account management
   ├── Chat / Responses
   ├── Web Search
@@ -59,7 +61,15 @@ chatgpt-gateway
 
 `wrangler.toml` phải chứa đúng `database_id` của database.
 
-Sau khi deploy code mới, cần chạy toàn bộ migrations. Đặc biệt migration `0002_admin_sessions.sql` tạo session admin.
+Schema gồm:
+
+```text
+accounts
+login_sessions
+admin_sessions
+usage_events
+rate_limits
+```
 
 ## 3. Secrets
 
@@ -77,19 +87,13 @@ Dùng cho Telegram, Open WebUI hoặc client API.
 ADMIN_USERNAME
 ```
 
-Ví dụ:
-
-```text
-admin
-```
-
 ### Admin password
 
 ```text
 ADMIN_PASSWORD
 ```
 
-Dùng một mật khẩu mạnh, riêng biệt. Đây là Cloudflare Secret, không commit vào GitHub.
+Dùng mật khẩu mạnh, riêng biệt. Đây là Cloudflare Secret, không commit vào GitHub.
 
 ### Encryption key
 
@@ -101,15 +105,48 @@ Giá trị phải là 64 ký tự hex = 32 bytes.
 
 Không còn sử dụng `GATEWAY_ADMIN_KEY` cho giao diện quản trị.
 
-## 4. Deploy migration
+## 4. Migration D1
 
-Nếu dùng Wrangler:
+Repository có các migration:
+
+```text
+migrations/0001_auth.sql
+migrations/0002_admin_sessions.sql
+migrations/0003_schema_repair.sql
+```
+
+`0003_schema_repair.sql` là migration idempotent để sửa các database đã deploy nhưng thiếu một hoặc nhiều bảng. Có thể chạy lại an toàn nhờ `CREATE TABLE IF NOT EXISTS` và `CREATE INDEX IF NOT EXISTS`.
+
+### Nếu dùng Wrangler
 
 ```bash
 npx wrangler d1 migrations apply chatgpt-gateway --remote
 ```
 
-Nếu chỉ dùng điện thoại, mở Cloudflare Dashboard → D1 → `chatgpt-gateway` và chạy migration bằng D1 Console nếu Dashboard hỗ trợ thao tác SQL của database.
+### Nếu chỉ dùng điện thoại
+
+Cloudflare Dashboard → **D1 → `chatgpt-gateway` → Console**.
+
+Nếu database đang thiếu schema, chạy SQL trong `migrations/0003_schema_repair.sql`.
+
+Kiểm tra:
+
+```sql
+SELECT name
+FROM sqlite_master
+WHERE type = 'table'
+ORDER BY name;
+```
+
+Phải có:
+
+```text
+accounts
+admin_sessions
+login_sessions
+rate_limits
+usage_events
+```
 
 ## 5. Deploy Worker
 
@@ -170,20 +207,26 @@ Sau khi đăng nhập Admin:
   ↓
 Bắt đầu đăng nhập
   ↓
-Device login
+Gateway tạo device code
   ↓
-Mở trang đăng nhập ChatGPT
+Mở https://auth.openai.com/codex/device
   ↓
 Nhập user code
   ↓
-Xác nhận tài khoản
+OpenAI xác nhận thiết bị
   ↓
-Gateway tự polling
+Gateway polling trạng thái
+  ↓
+OAuth token exchange
+  ↓
+Credential mã hóa trong D1
   ↓
 Account Active
 ```
 
-Không nhập email/password ChatGPT vào Gateway.
+Gateway không yêu cầu email/password ChatGPT.
+
+Device login sử dụng các endpoint mà Codex hiện dùng cho device authorization và token exchange. Đây là giao thức dịch vụ Codex, không phải API authentication contract công khai của OpenAI. Các endpoint có thể thay đổi.
 
 ## 8. Quản lý ChatGPT account
 
@@ -297,15 +340,13 @@ Metrics chỉ lưu metadata như route, model, status, latency và account refer
 - API key và Admin login là hai lớp credential độc lập.
 - Dùng HTTPS.
 
-## 18. Sau khi đổi sang Admin Login
+## 18. Secrets sau khi đổi sang Admin Login
 
 Xóa Secret cũ nếu còn:
 
 ```text
 GATEWAY_ADMIN_KEY
 ```
-
-Không cần dùng nó nữa.
 
 Giữ:
 
@@ -322,17 +363,18 @@ CHATGPT_TOKEN_ENCRYPTION_KEY
 1. /health
 2. /auth
 3. Đăng nhập Admin
-4. Tạo session thành công
-5. Đăng nhập ChatGPT
-6. Account Active
-7. Chat
-8. Streaming
-9. Web Search
-10. Image
-11. Image Edit
-12. /v1/usage
+4. Kiểm tra admin session
+5. Bắt đầu ChatGPT device login
+6. Xác nhận device code
+7. Account Active
+8. Chat
+9. Streaming
+10. Web Search
+11. Image
+12. Image Edit
+13. /v1/usage
 ```
 
-## 20. License
+## License
 
 MIT
