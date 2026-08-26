@@ -1,122 +1,143 @@
 # ChatGPT Gateway
 
-Cloudflare Worker gateway that exposes a small OpenAI-compatible API surface for ChatGPT/Codex upstreams.
+Cloudflare Worker gateway cho API tương thích OpenAI, kết nối tới ChatGPT/Codex upstream.
 
-## Capabilities
+> **Lưu ý:** upstream ChatGPT/Codex sử dụng endpoint dịch vụ riêng, không phải OpenAI Public API. Endpoint có thể thay đổi bất kỳ lúc nào.
 
-- Chat + Responses
+## Chức năng
+
+- Chat
+- Responses API
 - SSE streaming
-- Web Search through the Responses `web_search` tool
-- GPT Image generation and editing
-- Device-code authentication boundary
-- Encrypted credential persistence in D1
-- Automatic access-token refresh
-- Per-client rate limiting
-- Usage and latency metrics
-- Upstream retry/backoff for transient 429/502/503/504 responses
+- Web Search
+- GPT Image generation
+- GPT Image editing
+- Đăng nhập ChatGPT bằng giao diện web trên điện thoại
+- Lưu credential phía server trong Cloudflare D1, mã hóa AES-256-GCM
+- Tự refresh access token
+- Rate limit theo client
+- Usage/latency metrics
+- Retry/backoff cho lỗi tạm thời
 
-## Architecture
+## Kiến trúc
 
 ```text
-Admin
-  │
-  ├── /auth/device/start
-  ├── ChatGPT device login
-  └── /auth/device/poll
+Điện thoại
+   │
+   ▼
+Web Admin UI
+   │
+   ├── Đăng nhập ChatGPT
+   ├── Quản lý account
+   └── Kiểm tra trạng thái
           │
           ▼
-      OAuth credential store
+Cloudflare Worker
+   │
+   ├── Authentication
+   ├── Validation
+   ├── Rate limit
+   ├── Metrics
+   └── Provider adapter
           │
-          ▼
-      Cloudflare D1
-
-Client ── API key ──► Worker
-                         │
-                         ├── validation
-                         ├── rate limit
-                         ├── request metrics
-                         └── provider adapter
-                                  │
-                                  ├── Chat / Responses
-                                  ├── Web Search
-                                  └── GPT Image
+          ├── Chat / Responses
+          ├── Web Search
+          └── GPT Image
 ```
 
-## Endpoints
+## 1. Chuẩn bị
 
-### Health
+Bạn chỉ cần điện thoại + trình duyệt. Có thể thao tác phần Cloudflare trực tiếp trên Cloudflare Dashboard.
 
-`GET /health`
+Tạo/clone repository:
 
-### API
-
-- `GET /v1/models`
-- `GET /v1/usage`
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `POST /v1/images/generations`
-- `POST /v1/images/edits`
-
-API authentication:
-
-```http
-Authorization: Bearer $GATEWAY_API_KEY
+```text
+https://github.com/traique/chatgpt-gateway
 ```
 
-### Admin
-
-- `POST /auth/device/start`
-- `POST /auth/device/poll`
-- `GET /auth/accounts`
-- `DELETE /auth/accounts/:id`
-
-Admin authentication:
-
-```http
-Authorization: Bearer $GATEWAY_ADMIN_KEY
-```
-
-## Login flow
-
-1. Deploy the Worker and D1 schema.
-2. Start a device login:
+Nếu dùng GitHub Codespaces hoặc một máy có Node.js:
 
 ```bash
-curl -X POST https://YOUR_GATEWAY/auth/device/start \
-  -H "Authorization: Bearer $GATEWAY_ADMIN_KEY"
+npm install
+npm test
+npm run typecheck
 ```
 
-3. Open the returned `verification_url` and enter `user_code`.
-4. Poll the login session:
+## 2. Tạo Cloudflare Worker
 
-```bash
-curl -X POST https://YOUR_GATEWAY/auth/device/poll \
-  -H "Authorization: Bearer $GATEWAY_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"login_id":"LOGIN_ID","label":"primary"}'
+Mở:
+
+https://dash.cloudflare.com/
+
+Chọn:
+
+```text
+Workers & Pages
+→ Create
+→ Import a repository
+→ GitHub
+→ traique/chatgpt-gateway
 ```
 
-5. Continue polling until `status` is `completed`.
+Chọn branch:
 
-The gateway keeps credential material server-side and never exposes it through the account-management endpoints.
-
-## Cloudflare setup
-
-Create D1:
-
-```bash
-npx wrangler d1 create chatgpt-gateway
+```text
+main
 ```
 
-Set the returned `database_id` in `wrangler.toml` and apply migrations:
+Build command:
+
+```text
+npm run deploy
+```
+
+> Nếu Cloudflare Dashboard không cho dùng `wrangler deploy` trong build configuration của bạn, hãy dùng GitHub Actions hoặc deploy bằng Wrangler từ Codespaces/Termux.
+
+## 3. Tạo D1 Database
+
+Trong Cloudflare Dashboard:
+
+```text
+Workers & Pages
+→ D1 SQL Database
+→ Create database
+```
+
+Tên:
+
+```text
+chatgpt-gateway
+```
+
+Sau khi tạo, lấy `database_id`.
+
+Mở `wrangler.toml` và thay:
+
+```toml
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+```
+
+bằng ID thật.
+
+Nếu deploy bằng Wrangler:
 
 ```bash
 npx wrangler d1 migrations apply chatgpt-gateway --remote
 ```
 
-For an existing deployment that already applied `0001_auth.sql`, the observability tables must also be applied once. The definitions are included in `0001_auth.sql` for fresh databases; for an already migrated database, run the equivalent `usage_events` and `rate_limits` table definitions manually before enabling strict rate limiting.
+## 4. Tạo Secrets
 
-Secrets:
+Không lưu các secret trong GitHub hoặc `wrangler.toml`.
+
+Tạo:
+
+```text
+GATEWAY_API_KEY
+GATEWAY_ADMIN_KEY
+CHATGPT_TOKEN_ENCRYPTION_KEY
+```
+
+Nếu dùng Wrangler:
 
 ```bash
 npx wrangler secret put GATEWAY_API_KEY
@@ -124,80 +145,341 @@ npx wrangler secret put GATEWAY_ADMIN_KEY
 npx wrangler secret put CHATGPT_TOKEN_ENCRYPTION_KEY
 ```
 
-Generate the encryption key:
+Tạo encryption key:
 
 ```bash
 openssl rand -hex 32
 ```
 
-## Chat
+Nếu chỉ dùng điện thoại, có thể tạo secret ngẫu nhiên bằng một password manager đáng tin cậy. Không dùng lại mật khẩu ChatGPT.
+
+## 5. Deploy
+
+Sau khi cấu hình repository + D1 + secrets:
 
 ```bash
-curl https://YOUR_GATEWAY/v1/chat/completions \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+npm install
+npm run typecheck
+npm test
+npm run deploy
+```
+
+Worker sẽ có địa chỉ dạng:
+
+```text
+https://chatgpt-gateway.<subdomain>.workers.dev
+```
+
+Kiểm tra:
+
+```text
+GET /health
+```
+
+Ví dụ:
+
+```text
+https://chatgpt-gateway.<subdomain>.workers.dev/health
+```
+
+## 6. Giao diện đăng nhập trên điện thoại
+
+Không cần dùng `curl` để đăng nhập.
+
+Mở trên điện thoại:
+
+```text
+https://YOUR_GATEWAY/auth
+```
+
+Giao diện cần thực hiện flow:
+
+```text
+Đăng nhập ChatGPT
+      ↓
+Bấm "Bắt đầu đăng nhập"
+      ↓
+Worker tạo device session
+      ↓
+Hiển thị verification URL + user code
+      ↓
+Bấm "Mở trang đăng nhập"
+      ↓
+Đăng nhập ChatGPT
+      ↓
+Quay lại trang Gateway
+      ↓
+Gateway tự poll trạng thái
+      ↓
+Hiển thị "Đã kết nối"
+```
+
+### Lưu ý về thiết kế login
+
+- Không yêu cầu nhập email/password ChatGPT vào Gateway.
+- Không đưa access token/refresh token vào trình duyệt.
+- Trình duyệt chỉ nhận `login_id`, trạng thái và thông tin hướng dẫn.
+- Credential được xử lý phía Worker.
+- Endpoint quản trị phải được bảo vệ bằng `GATEWAY_ADMIN_KEY` hoặc một session admin riêng.
+
+## 7. Quản lý tài khoản
+
+Sau khi đăng nhập, giao diện quản trị nên hiển thị:
+
+```text
+ChatGPT Accounts
+
+● primary       Active
+● backup        Active
+○ old-account   Disabled
+```
+
+Không hiển thị:
+
+```text
+access_token
+refresh_token
+id_token
+```
+
+Có thể cho phép:
+
+```text
++ Thêm tài khoản
+⟳ Refresh trạng thái
+✕ Disable tài khoản
+🗑 Xóa tài khoản
+```
+
+## 8. API Key cho ứng dụng
+
+Các ứng dụng Telegram/Open WebUI/app của bạn chỉ cần:
+
+```http
+Authorization: Bearer YOUR_GATEWAY_API_KEY
+```
+
+Không cần biết credential ChatGPT.
+
+## 9. Chat
+
+```bash
+curl -X POST https://YOUR_GATEWAY/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "chatgpt-gpt-5.6",
-    "messages": [{"role": "user", "content": "Hello"}],
+    "messages": [
+      {"role": "user", "content": "Xin chào"}
+    ],
     "stream": true
   }'
 ```
 
-## Web Search
+## 10. Web Search
 
 ```json
 {
   "model": "chatgpt-gpt-5.6",
   "messages": [
-    {"role": "user", "content": "What are the latest technology news today?"}
+    {
+      "role": "user",
+      "content": "Tin tức mới nhất về AI hôm nay?"
+    }
   ],
   "web_search": true,
   "stream": true
 }
 ```
 
-The gateway maps `web_search: true` to the upstream Responses `web_search` tool.
+Gateway map `web_search: true` thành upstream Responses `web_search` tool.
 
-## Image generation
+## 11. Tạo ảnh
 
 ```bash
-curl https://YOUR_GATEWAY/v1/images/generations \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST https://YOUR_GATEWAY/v1/images/generations \
+  -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "chatgpt-gpt-image-2",
-    "prompt": "A cinematic Vietnamese street at golden hour"
+    "prompt": "A cinematic Vietnamese woman walking in Saigon at golden hour, photorealistic"
   }'
 ```
 
-## Usage
+## 12. Chỉnh sửa ảnh
 
 ```bash
-curl https://YOUR_GATEWAY/v1/usage \
-  -H "Authorization: Bearer $GATEWAY_API_KEY"
+curl -X POST https://YOUR_GATEWAY/v1/images/edits \
+  -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "chatgpt-gpt-image-2",
+    "prompt": "Change the background to a modern Saigon street at sunset",
+    "image": "BASE64_OR_SUPPORTED_IMAGE_REFERENCE"
+  }'
 ```
 
-The summary covers the last seven days and reports request count, success count, failure count, and average latency. No prompts or response bodies are stored.
+## 13. Responses API
 
-## Reliability
+```json
+{
+  "model": "chatgpt-gpt-5.6",
+  "input": "Tìm thông tin mới nhất về Cloudflare Workers",
+  "web_search": true,
+  "stream": true
+}
+```
 
-Transient upstream statuses `429`, `502`, `503`, and `504` are retried up to three attempts with exponential backoff and `Retry-After` support. Streaming requests are only retried before a successful upstream response is established.
+Endpoint:
 
-## Security
+```text
+POST /v1/responses
+```
 
-- API and admin credentials are separate.
-- Stored credential material is encrypted at rest with AES-256-GCM.
-- Account listings never return access or refresh tokens.
-- Device login sessions expire.
-- Rate-limit keys are SHA-256 derived; raw API credentials are not written to metrics.
-- Usage telemetry stores route/model/status/latency only.
-- CORS is permissive by default; restrict it before exposing browser clients.
+## 14. Usage
 
-## Important limitation
+```text
+GET /v1/usage
+```
 
-The ChatGPT/Codex upstream endpoints used by this project are private service endpoints rather than the public OpenAI API. They can change without notice. Upstream protocol code is isolated in `src/providers.ts`, while authentication is isolated in `src/chatgpt-auth.ts`.
+Yêu cầu:
 
-## Local checks
+```http
+Authorization: Bearer YOUR_GATEWAY_API_KEY
+```
+
+Metrics chỉ lưu metadata:
+
+```text
+route
+model
+status
+latency
+account reference
+created_at
+```
+
+Không lưu prompt hoặc response.
+
+## 15. Rate Limit
+
+Gateway giới hạn request theo client/API key.
+
+Response có các header:
+
+```text
+X-RateLimit-Remaining
+X-RateLimit-Reset
+```
+
+## 16. Retry
+
+Các lỗi tạm thời được retry có giới hạn:
+
+```text
+429
+502
+503
+504
+```
+
+Có hỗ trợ `Retry-After` và exponential backoff.
+
+Không retry vô hạn.
+
+## 17. Domain riêng
+
+Trong Cloudflare:
+
+```text
+Workers & Pages
+→ chatgpt-gateway
+→ Settings
+→ Domains & Routes
+→ Add Custom Domain
+```
+
+Ví dụ:
+
+```text
+api.example.com
+```
+
+Sau đó API sẽ là:
+
+```text
+https://api.example.com/v1/chat/completions
+```
+
+## 18. Kiểm tra deployment
+
+Theo thứ tự:
+
+```text
+1. /health
+2. /v1/models
+3. /auth
+4. Đăng nhập ChatGPT
+5. Kiểm tra account Active
+6. Chat non-stream
+7. Chat stream
+8. Web Search
+9. Image generation
+10. Image edit
+11. /v1/usage
+```
+
+## 19. Bảo mật
+
+- Không commit API key.
+- Không commit encryption key.
+- Không nhập mật khẩu ChatGPT vào Gateway.
+- Không hiển thị OAuth token trên UI.
+- Không ghi prompt/response vào logs.
+- Dùng HTTPS.
+- Đổi `GATEWAY_API_KEY` định kỳ.
+- Không dùng `GATEWAY_ADMIN_KEY` làm API key cho Telegram.
+- Nếu mở API cho Internet, nên giới hạn CORS và thêm rate limit chặt hơn.
+
+## 20. Cấu trúc project
+
+```text
+chatgpt-gateway/
+├── src/
+│   ├── index.ts
+│   ├── types.ts
+│   ├── validation.ts
+│   ├── errors.ts
+│   ├── crypto.ts
+│   ├── chatgpt-auth.ts
+│   └── providers.ts
+├── migrations/
+│   └── 0001_auth.sql
+├── test/
+├── wrangler.toml
+├── package.json
+└── README.md
+```
+
+## 21. Giới hạn hiện tại
+
+ChatGPT/Codex upstream là service endpoint riêng và có thể thay đổi. Vì vậy:
+
+```text
+src/chatgpt-auth.ts
+```
+
+chịu trách nhiệm authentication, còn:
+
+```text
+src/providers.ts
+```
+
+chịu trách nhiệm upstream protocol.
+
+Tách hai phần này giúp thay đổi backend mà không phải viết lại toàn bộ API gateway.
+
+## 22. Local development
 
 ```bash
 npm install
@@ -205,3 +487,31 @@ npm test
 npm run typecheck
 npm run dev
 ```
+
+## 23. Deploy nhanh
+
+```text
+GitHub
+  ↓
+Cloudflare Workers
+  ↓
+Connect repository
+  ↓
+Set database_id
+  ↓
+Apply D1 migration
+  ↓
+Set 3 secrets
+  ↓
+Deploy
+  ↓
+Mở /auth trên điện thoại
+  ↓
+Login ChatGPT
+  ↓
+Dùng /v1/chat/completions
+```
+
+## License
+
+MIT
