@@ -1,23 +1,30 @@
 import { UpstreamError } from "./errors";
-import type { ChatGptToken, ChatCompletionRequest, Env, ImageEditRequest, ImageGenerationRequest } from "./types";
+import type { ChatGptToken, ChatCompletionRequest, Env, ImageEditRequest, ImageGenerationRequest, ResponsesRequest } from "./types";
 import { toResponsesInput } from "./validation";
 
 const MAX_UPSTREAM_ATTEMPTS = 3;
 const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
 
-export async function createResponsesResponse(env: Env, token: ChatGptToken, request: ChatCompletionRequest): Promise<Response> {
+export async function createResponsesResponse(env: Env, token: ChatGptToken, request: ResponsesRequest): Promise<Response> {
   const body: Record<string, unknown> = {
     model: normalizeChatModel(request.model),
-    input: toResponsesInput(request.messages),
+    input: request.input,
     stream: request.stream,
   };
+  if (request.instructions) body.instructions = request.instructions;
   if (request.webSearch) body.tools = [{ type: "web_search" }];
-  if (request.maxTokens !== undefined) body.max_output_tokens = request.maxTokens;
+  if (request.maxOutputTokens !== undefined) body.max_output_tokens = request.maxOutputTokens;
   return fetchCodex(env.CHATGPT_CODEX_ENDPOINT, token, body, request.stream);
 }
 
 export async function createChatCompletionResponse(env: Env, token: ChatGptToken, request: ChatCompletionRequest): Promise<Response> {
-  const upstream = await createResponsesResponse(env, token, request);
+  const upstream = await createResponsesResponse(env, token, {
+    model: request.model,
+    input: toResponsesInput(request.messages),
+    stream: request.stream,
+    maxOutputTokens: request.maxTokens,
+    webSearch: request.webSearch,
+  });
   if (!request.stream) return mapResponseToChatCompletion(upstream, request.model);
   return mapStreamToChatCompletion(upstream, request.model);
 }
@@ -42,12 +49,7 @@ async function fetchCodex(endpoint: string, token: ChatGptToken, body: Record<st
   for (let attempt = 1; attempt <= MAX_UPSTREAM_ATTEMPTS; attempt += 1) {
     const response = await fetch(endpoint, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token.accessToken}`,
-        "chatgpt-account-id": token.accountId,
-        "content-type": "application/json",
-        Accept: stream ? "text/event-stream" : "application/json",
-      },
+      headers: { Authorization: `Bearer ${token.accessToken}`, "chatgpt-account-id": token.accountId, "content-type": "application/json", Accept: stream ? "text/event-stream" : "application/json" },
       body: JSON.stringify(body),
     });
     if (response.ok) return response;
@@ -113,9 +115,7 @@ function mapStreamToChatCompletion(response: Response, model: string): Response 
       buffer = lines.pop() ?? "";
       emitStreamLines(lines.join("\n"), controller, encoder, id, created, model);
     },
-    cancel() {
-      void reader.cancel();
-    },
+    cancel() { void reader.cancel(); },
   });
   return new Response(stream, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" } });
 }
@@ -125,11 +125,7 @@ function emitStreamLines(text: string, controller: ReadableStreamDefaultControll
     const data = line.trim().startsWith("data:") ? line.trim().slice(5).trim() : "";
     if (!data || data === "[DONE]") continue;
     let payload: unknown;
-    try {
-      payload = JSON.parse(data);
-    } catch {
-      continue;
-    }
+    try { payload = JSON.parse(data); } catch { continue; }
     if (!isRecord(payload) || payload.type !== "response.output_text.delta" || typeof payload.delta !== "string") continue;
     controller.enqueue(encoder.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: payload.delta }, finish_reason: null }] })}\n\n`));
   }
@@ -142,9 +138,7 @@ function extractOutputText(payload: unknown): string {
   const parts: string[] = [];
   for (const item of payload.output) {
     if (!isRecord(item) || item.type !== "message" || !Array.isArray(item.content)) continue;
-    for (const content of item.content) {
-      if (isRecord(content) && content.type === "output_text" && typeof content.text === "string") parts.push(content.text);
-    }
+    for (const content of item.content) if (isRecord(content) && content.type === "output_text" && typeof content.text === "string") parts.push(content.text);
   }
   return parts.join("");
 }
