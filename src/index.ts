@@ -4,6 +4,7 @@ import { createChatCompletionResponse, createImageEditResponse, createImageRespo
 import { createRequestContext, enforceRateLimit, getUsageSummary, recordUsage } from "./observability";
 import { validateChatRequest, validateImageEditRequest, validateImageGenerationRequest, validateResponsesRequest } from "./validation";
 import type { Env } from "./types";
+import { renderAdminPage } from "./admin-page";
 
 const DEFAULT_CHAT_MODEL = "chatgpt-gpt-5.6";
 const IMAGE_MODEL = "chatgpt-gpt-image-2";
@@ -15,6 +16,7 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return json({ ok: true, service: "chatgpt-gateway" });
+    if (request.method === "GET" && (url.pathname === "/auth" || url.pathname === "/auth/")) return renderAdminPage();
     if (url.pathname.startsWith("/auth/")) return handleAuthRoute(request, env, url);
     if (!isAuthorized(request, env)) return errorResponse("authentication_error", "Invalid API key.", 401);
     if (request.method === "GET" && url.pathname === "/v1/models") return modelsResponse();
@@ -67,9 +69,7 @@ async function startDeviceAuth(env: Env): Promise<Response> {
   try {
     const session = await startDeviceLogin(env);
     return json({ login_id: session.id, verification_url: DEVICE_VERIFICATION_URL, user_code: session.userCode, interval_seconds: session.intervalSeconds, expires_at: session.expiresAt });
-  } catch (error) {
-    return mapError(error);
-  }
+  } catch (error) { return mapError(error); }
 }
 
 async function pollDeviceAuth(request: Request, env: Env): Promise<Response> {
@@ -79,9 +79,7 @@ async function pollDeviceAuth(request: Request, env: Env): Promise<Response> {
     const label = typeof payload.label === "string" ? payload.label : "";
     const session = await pollDeviceLogin(env, payload.login_id, label);
     return json({ login_id: session.id, status: session.status });
-  } catch (error) {
-    return mapError(error);
-  }
+  } catch (error) { return mapError(error); }
 }
 
 function isAuthorized(request: Request, env: Env): boolean {
@@ -107,10 +105,7 @@ async function proxyResponse(response: Response): Promise<Response> {
 
 function modelsResponse(): Response {
   const created = Math.floor(Date.now() / 1000);
-  return json({ object: "list", data: [
-    { id: DEFAULT_CHAT_MODEL, object: "model", created, owned_by: "openai-chatgpt" },
-    { id: IMAGE_MODEL, object: "model", created, owned_by: "openai-chatgpt" },
-  ] });
+  return json({ object: "list", data: [{ id: DEFAULT_CHAT_MODEL, object: "model", created, owned_by: "openai-chatgpt" }, { id: IMAGE_MODEL, object: "model", created, owned_by: "openai-chatgpt" }] });
 }
 
 function mapError(error: unknown): Response {
@@ -121,39 +116,11 @@ function mapError(error: unknown): Response {
   return errorResponse("server_error", message, 500);
 }
 
-function json(value: unknown, status = 200): Response {
-  return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...corsHeaders() } });
-}
-
-function errorResponse(type: string, message: string, status: number): Response {
-  return json({ error: { type, message } }, status);
-}
-
-function rateLimitResponse(resetAt: number): Response {
-  return withRateLimitHeaders(errorResponse("rate_limit_error", "Rate limit exceeded.", 429), 0, resetAt);
-}
-
-function withRateLimitHeaders(response: Response, remaining: number, resetAt: number): Response {
-  const headers = new Headers(response.headers);
-  headers.set("x-ratelimit-remaining", String(remaining));
-  headers.set("x-ratelimit-reset", String(Math.ceil(resetAt / 1000)));
-  return new Response(response.body, { status: response.status, headers });
-}
-
-async function hashClientKey(request: Request): Promise<string> {
-  const identity = request.headers.get("x-api-key") ?? request.headers.get("authorization") ?? request.headers.get("cf-connecting-ip") ?? "anonymous";
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 32);
-}
-
-function readModel(payload: unknown): string {
-  return isRecord(payload) && typeof payload.model === "string" ? payload.model : "unknown";
-}
-
-function corsHeaders(): Record<string, string> {
-  return { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type, x-api-key, x-admin-key", "access-control-allow-methods": "GET, POST, DELETE, OPTIONS" };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+function json(value: unknown, status = 200): Response { return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...corsHeaders() } }); }
+function errorResponse(type: string, message: string, status: number): Response { return json({ error: { type, message } }, status); }
+function rateLimitResponse(resetAt: number): Response { return withRateLimitHeaders(errorResponse("rate_limit_error", "Rate limit exceeded.", 429), 0, resetAt); }
+function withRateLimitHeaders(response: Response, remaining: number, resetAt: number): Response { const headers = new Headers(response.headers); headers.set("x-ratelimit-remaining", String(remaining)); headers.set("x-ratelimit-reset", String(Math.ceil(resetAt / 1000))); return new Response(response.body, { status: response.status, headers }); }
+async function hashClientKey(request: Request): Promise<string> { const identity = request.headers.get("x-api-key") ?? request.headers.get("authorization") ?? request.headers.get("cf-connecting-ip") ?? "anonymous"; const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity)); return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 32); }
+function readModel(payload: unknown): string { return isRecord(payload) && typeof payload.model === "string" ? payload.model : "unknown"; }
+function corsHeaders(): Record<string, string> { return { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type, x-api-key, x-admin-key", "access-control-allow-methods": "GET, POST, DELETE, OPTIONS" }; }
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
