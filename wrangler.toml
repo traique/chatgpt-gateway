@@ -15,6 +15,7 @@ database_id = "b06402d1-adba-4a96-a022-42b26d478a4c"
 migrations_dir = "migrations"
 
 # Secrets:
-# wrangler secret put GATEWAY_API_KEY
-# wrangler secret put GATEWAY_ADMIN_KEY
-# wrangler secret put CHATGPT_TOKEN_ENCRYPTION_KEY
+# GATEWAY_API_KEY
+# ADMIN_USERNAME
+# ADMIN_PASSWORD
+# CHATGPT_TOKEN_ENCRYPTION_KEY
