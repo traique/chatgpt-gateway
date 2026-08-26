@@ -2,7 +2,7 @@ import { disableAccount, getChatGptToken, listAccounts, pollDeviceLogin, startDe
 import { GatewayRequestError, UpstreamError } from "./errors";
 import { createChatCompletionResponse, createImageEditResponse, createImageResponse, createResponsesResponse } from "./providers";
 import { createRequestContext, enforceRateLimit, getUsageSummary, recordUsage } from "./observability";
-import { validateChatRequest, validateImageEditRequest, validateImageGenerationRequest } from "./validation";
+import { validateChatRequest, validateImageEditRequest, validateImageGenerationRequest, validateResponsesRequest } from "./validation";
 import type { Env } from "./types";
 
 const DEFAULT_CHAT_MODEL = "chatgpt-gpt-5.6";
@@ -13,16 +13,13 @@ const API_RATE_LIMIT = 60;
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
-
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return json({ ok: true, service: "chatgpt-gateway" });
     if (url.pathname.startsWith("/auth/")) return handleAuthRoute(request, env, url);
-
     if (!isAuthorized(request, env)) return errorResponse("authentication_error", "Invalid API key.", 401);
     if (request.method === "GET" && url.pathname === "/v1/models") return modelsResponse();
     if (request.method === "GET" && url.pathname === "/v1/usage") return json(await getUsageSummary(env));
     if (request.method !== "POST") return errorResponse("invalid_request_error", "Method not allowed.", 405);
-
     return handleApiRequest(request, env, url);
   },
 } satisfies ExportedHandler<Env>;
@@ -31,7 +28,6 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
   const context = createRequestContext();
   const rateLimit = await enforceRateLimit(env, await hashClientKey(request), API_RATE_LIMIT);
   if (!rateLimit.allowed) return rateLimitResponse(rateLimit.resetAt);
-
   try {
     const payload: unknown = await request.json();
     const token = await getChatGptToken(env);
@@ -40,14 +36,14 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
     return withRateLimitHeaders(response, rateLimit.remaining, rateLimit.resetAt);
   } catch (error) {
     const response = mapError(error);
-    await recordUsage(env, url.pathname, readModelSafe(request), response.status, Date.now() - context.startedAt);
+    await recordUsage(env, url.pathname, "unknown", response.status, Date.now() - context.startedAt);
     return withRateLimitHeaders(response, rateLimit.remaining, rateLimit.resetAt);
   }
 }
 
 async function routeApiRequest(pathname: string, env: Env, token: Awaited<ReturnType<typeof getChatGptToken>>, payload: unknown): Promise<Response> {
   if (pathname === "/v1/chat/completions") return proxyResponse(await createChatCompletionResponse(env, token, validateChatRequest(payload)));
-  if (pathname === "/v1/responses") return proxyResponse(await createResponsesResponse(env, token, validateChatRequest(payload)));
+  if (pathname === "/v1/responses") return proxyResponse(await createResponsesResponse(env, token, validateResponsesRequest(payload)));
   if (pathname === "/v1/images/generations") return proxyResponse(await createImageResponse(env, token, validateImageGenerationRequest(payload)));
   if (pathname === "/v1/images/edits") return proxyResponse(await createImageEditResponse(env, token, validateImageEditRequest(payload)));
   throw new GatewayRequestError("Unknown endpoint.");
@@ -152,10 +148,6 @@ async function hashClientKey(request: Request): Promise<string> {
 
 function readModel(payload: unknown): string {
   return isRecord(payload) && typeof payload.model === "string" ? payload.model : "unknown";
-}
-
-function readModelSafe(request: Request): string {
-  return request.headers.get("x-model") ?? "unknown";
 }
 
 function corsHeaders(): Record<string, string> {
