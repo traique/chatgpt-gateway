@@ -16,7 +16,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/health") return json({ ok: true, service: "chatgpt-gateway" });
+    if (request.method === "GET" && url.pathname === "/health") return healthResponse(env);
     if (request.method === "GET" && (url.pathname === "/auth" || url.pathname === "/auth/")) return renderAdminPage();
     if (url.pathname.startsWith("/auth/")) return handleAuthRoute(request, env, url);
     if (!isAuthorized(request, env)) return errorResponse("authentication_error", "Invalid API key.", 401);
@@ -26,6 +26,29 @@ export default {
     return handleApiRequest(request, env, url);
   },
 } satisfies ExportedHandler<Env>;
+
+async function healthResponse(env: Env): Promise<Response> {
+  let databaseConfigured = false;
+  try {
+    await env.DB.prepare("SELECT 1").first();
+    databaseConfigured = true;
+  } catch {
+    databaseConfigured = false;
+  }
+
+  const diagnostics = {
+    api_key_configured: Boolean(env.GATEWAY_API_KEY?.trim()),
+    admin_credentials_configured: Boolean(env.ADMIN_USERNAME?.trim() && env.ADMIN_PASSWORD?.trim()),
+    encryption_key_configured: Boolean(env.CHATGPT_TOKEN_ENCRYPTION_KEY?.trim()),
+    database_configured: databaseConfigured,
+  };
+
+  return json({
+    ok: Object.values(diagnostics).every(Boolean),
+    service: "chatgpt-gateway",
+    diagnostics,
+  }, Object.values(diagnostics).every(Boolean) ? 200 : 503);
+}
 
 async function handleApiRequest(request: Request, env: Env, url: URL): Promise<Response> {
   const context = createRequestContext();
