@@ -1,3 +1,4 @@
+import { authenticateAdmin, ADMIN_SESSION_COOKIE, cleanupAdminSessions, isAdminSessionValid, revokeAdminSession } from "./admin-auth";
 import { disableAccount, getChatGptToken, listAccounts, pollDeviceLogin, startDeviceLogin } from "./auth";
 import { GatewayRequestError, UpstreamError } from "./errors";
 import { createChatCompletionResponse, createImageEditResponse, createImageResponse, createResponsesResponse } from "./providers";
@@ -52,7 +53,13 @@ async function routeApiRequest(pathname: string, env: Env, token: Awaited<Return
 }
 
 async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Response> {
-  if (!isAdminAuthorized(request, env)) return errorResponse("authentication_error", "Invalid admin API key.", 401);
+  if (request.method === "POST" && url.pathname === "/auth/login") return loginAdmin(request, env);
+  if (request.method === "POST" && url.pathname === "/auth/logout") return logoutAdmin(request, env);
+  if (request.method === "GET" && url.pathname === "/auth/me") return adminMe(request, env);
+
+  const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request));
+  if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401);
+
   if (request.method === "POST" && url.pathname === "/auth/device/start") return startDeviceAuth(env);
   if (request.method === "POST" && url.pathname === "/auth/device/poll") return pollDeviceAuth(request, env);
   if (request.method === "GET" && url.pathname === "/auth/accounts") return json({ data: await listAccounts(env) });
@@ -63,6 +70,45 @@ async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Re
     return json({ ok: true });
   }
   return errorResponse("invalid_request_error", "Unknown authentication endpoint.", 404);
+}
+
+async function loginAdmin(request: Request, env: Env): Promise<Response> {
+  try {
+    const payload: unknown = await request.json();
+    if (!isRecord(payload) || typeof payload.username !== "string" || typeof payload.password !== "string") {
+      return errorResponse("invalid_request_error", "Username and password are required.", 400);
+    }
+    const token = await authenticateAdmin(env, payload.username, payload.password);
+    if (!token) return errorResponse("authentication_error", "Sai tài khoản hoặc mật khẩu.", 401);
+    await cleanupAdminSessions(env);
+    return json({ ok: true }, 200, sessionCookie(token));
+  } catch (error) {
+    return mapError(error);
+  }
+}
+
+async function logoutAdmin(request: Request, env: Env): Promise<Response> {
+  await revokeAdminSession(env, readAdminSessionCookie(request));
+  return json({ ok: true }, 200, expiredSessionCookie());
+}
+
+async function adminMe(request: Request, env: Env): Promise<Response> {
+  const valid = await isAdminSessionValid(env, readAdminSessionCookie(request));
+  return json({ authenticated: valid });
+}
+
+function sessionCookie(token: string): Record<string, string> {
+  return { "set-cookie": `${ADMIN_SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=43200` };
+}
+
+function expiredSessionCookie(): Record<string, string> {
+  return { "set-cookie": `${ADMIN_SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0` };
+}
+
+function readAdminSessionCookie(request: Request): string | null {
+  const cookieHeader = request.headers.get("cookie") ?? "";
+  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${ADMIN_SESSION_COOKIE}=([^;]+)`));
+  return match?.[1] ?? null;
 }
 
 async function startDeviceAuth(env: Env): Promise<Response> {
@@ -89,13 +135,6 @@ function isAuthorized(request: Request, env: Env): boolean {
   return Boolean(apiKey && apiKey === env.GATEWAY_API_KEY);
 }
 
-function isAdminAuthorized(request: Request, env: Env): boolean {
-  const authorization = request.headers.get("authorization") ?? "";
-  const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-  const adminKey = bearer ?? request.headers.get("x-admin-key")?.trim();
-  return Boolean(adminKey && adminKey === env.GATEWAY_ADMIN_KEY);
-}
-
 async function proxyResponse(response: Response): Promise<Response> {
   const headers = new Headers(response.headers);
   for (const [key, value] of Object.entries(corsHeaders())) headers.set(key, value);
@@ -116,11 +155,11 @@ function mapError(error: unknown): Response {
   return errorResponse("server_error", message, 500);
 }
 
-function json(value: unknown, status = 200): Response { return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...corsHeaders() } }); }
+function json(value: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response { return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...corsHeaders(), ...extraHeaders } }); }
 function errorResponse(type: string, message: string, status: number): Response { return json({ error: { type, message } }, status); }
 function rateLimitResponse(resetAt: number): Response { return withRateLimitHeaders(errorResponse("rate_limit_error", "Rate limit exceeded.", 429), 0, resetAt); }
 function withRateLimitHeaders(response: Response, remaining: number, resetAt: number): Response { const headers = new Headers(response.headers); headers.set("x-ratelimit-remaining", String(remaining)); headers.set("x-ratelimit-reset", String(Math.ceil(resetAt / 1000))); return new Response(response.body, { status: response.status, headers }); }
 async function hashClientKey(request: Request): Promise<string> { const identity = request.headers.get("x-api-key") ?? request.headers.get("authorization") ?? request.headers.get("cf-connecting-ip") ?? "anonymous"; const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity)); return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 32); }
 function readModel(payload: unknown): string { return isRecord(payload) && typeof payload.model === "string" ? payload.model : "unknown"; }
-function corsHeaders(): Record<string, string> { return { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type, x-api-key, x-admin-key", "access-control-allow-methods": "GET, POST, DELETE, OPTIONS" }; }
+function corsHeaders(): Record<string, string> { return { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type, x-api-key", "access-control-allow-methods": "GET, POST, DELETE, OPTIONS" }; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
