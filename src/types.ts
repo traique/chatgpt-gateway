@@ -1,9 +1,12 @@
 export interface Env {
   GATEWAY_API_KEY: string;
-  CHATGPT_AUTH_TOKEN_PROVIDER_URL: string;
-  CHATGPT_AUTH_TOKEN_PROVIDER_API_KEY: string;
+  GATEWAY_ADMIN_KEY: string;
   CHATGPT_CODEX_ENDPOINT: string;
   CHATGPT_CODEX_IMAGES_ENDPOINT: string;
+  CHATGPT_AUTH_BASE_URL: string;
+  CHATGPT_OAUTH_CLIENT_ID: string;
+  CHATGPT_TOKEN_ENCRYPTION_KEY: string;
+  DB: D1Database;
 }
 
 export interface ChatGptToken {
@@ -39,4 +42,25 @@ export interface ImageEditRequest {
   model: string;
   prompt: string;
   image: string | string[];
+}
+
+export interface StoredAccount {
+  id: string;
+  label: string;
+  accountId: string;
+  accessTokenEncrypted: string;
+  refreshTokenEncrypted: string;
+  idTokenEncrypted?: string;
+  expiresAt: number;
+  status: "active" | "expired" | "disabled";
+  cooldownUntil: number;
+}
+
+export interface DeviceLoginSession {
+  id: string;
+  deviceAuthId: string;
+  userCode: string;
+  intervalSeconds: number;
+  expiresAt: number;
+  status: "pending" | "completed" | "failed" | "expired";
 }
