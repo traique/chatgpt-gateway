@@ -4,21 +4,23 @@ import type { ChatGptToken, DeviceLoginSession, Env, StoredAccount } from "./typ
 
 const TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
 const DEVICE_LOGIN_TTL_MS = 15 * 60 * 1000;
+const MIN_DEVICE_POLL_INTERVAL_SECONDS = 3;
 const REFRESH_LEASE_MS = 30 * 1000;
 const OAUTH_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback";
+const CODEX_AUTH_USER_AGENT = "codex_cli_rs/0.0.0";
 
 export async function startDeviceLogin(env: Env): Promise<DeviceLoginSession> {
   const response = await fetch(`${trimBaseUrl(env.CHATGPT_AUTH_BASE_URL)}/api/accounts/deviceauth/usercode`, {
     method: "POST",
-    headers: { "content-type": "application/json", "user-agent": "Codex/ChatGPT-Gateway" },
+    headers: codexAuthHeaders(),
     body: JSON.stringify({ client_id: env.CHATGPT_OAUTH_CLIENT_ID }),
   });
-  if (!response.ok) throw new GatewayAuthError(`Device login initialization failed: HTTP ${response.status}.`);
+  if (!response.ok) throw new GatewayAuthError(`Device login initialization failed: ${await readUpstreamError(response)}`);
 
   const payload: unknown = await response.json();
   const deviceAuthId = readString(payload, "device_auth_id");
   const userCode = readString(payload, "user_code") ?? readString(payload, "usercode");
-  const intervalSeconds = readNumber(payload, "interval") ?? 5;
+  const intervalSeconds = Math.max(readNumber(payload, "interval") ?? 5, MIN_DEVICE_POLL_INTERVAL_SECONDS);
   if (!deviceAuthId || !userCode) throw new GatewayAuthError("Device login returned an invalid payload.");
 
   const now = Date.now();
@@ -46,14 +48,14 @@ export async function pollDeviceLogin(env: Env, sessionId: string, label: string
 
   const response = await fetch(`${trimBaseUrl(env.CHATGPT_AUTH_BASE_URL)}/api/accounts/deviceauth/token`, {
     method: "POST",
-    headers: { "content-type": "application/json", "user-agent": "Codex/ChatGPT-Gateway" },
+    headers: codexAuthHeaders(),
     body: JSON.stringify({ device_auth_id: session.deviceAuthId, user_code: session.userCode }),
   });
 
   if (response.status === 403 || response.status === 404) return session;
   if (!response.ok) {
     await updateSessionStatus(env, session, "failed");
-    throw new GatewayAuthError(`Device login failed: HTTP ${response.status}.`);
+    throw new GatewayAuthError(`Device login failed: ${await readUpstreamError(response)}`);
   }
 
   const payload: unknown = await response.json();
@@ -62,6 +64,7 @@ export async function pollDeviceLogin(env: Env, sessionId: string, label: string
   if (!authorizationCode || !codeVerifier) throw new GatewayAuthError("Device login returned an invalid authorization payload.");
 
   const tokens = await exchangeAuthorizationCode(env, authorizationCode, codeVerifier);
+  if (!tokens.refreshToken) throw new GatewayAuthError("OAuth token response is missing refresh_token.");
   const accountId = extractAccountId(tokens.idToken) ?? extractAccountId(tokens.accessToken);
   if (!accountId) throw new GatewayAuthError("ChatGPT token response did not contain an account ID.");
 
@@ -126,7 +129,7 @@ async function refreshAccount(env: Env, account: StoredAccount): Promise<ChatGpt
     const tokens = await exchangeRefreshToken(env, refreshToken);
     const now = Date.now();
     const encryptedAccessToken = await encryptSecret(tokens.accessToken, env.CHATGPT_TOKEN_ENCRYPTION_KEY);
-    const encryptedRefreshToken = await encryptSecret(tokens.refreshToken, env.CHATGPT_TOKEN_ENCRYPTION_KEY);
+    const encryptedRefreshToken = await encryptSecret(tokens.refreshToken ?? refreshToken, env.CHATGPT_TOKEN_ENCRYPTION_KEY);
     const encryptedIdToken = tokens.idToken ? await encryptSecret(tokens.idToken, env.CHATGPT_TOKEN_ENCRYPTION_KEY) : account.idTokenEncrypted;
     await env.DB.prepare(
       "UPDATE accounts SET access_token_enc = ?, refresh_token_enc = ?, id_token_enc = ?, expires_at = ?, cooldown_until = 0, last_error = NULL, updated_at = ? WHERE id = ?",
@@ -196,20 +199,41 @@ async function exchangeRefreshToken(env: Env, refreshToken: string): Promise<OAu
 async function exchangeOAuth(env: Env, parameters: Record<string, string>): Promise<OAuthTokenResponse> {
   const response = await fetch(`${trimBaseUrl(env.CHATGPT_AUTH_BASE_URL)}/oauth/token`, {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", "user-agent": "Codex/ChatGPT-Gateway" },
+    headers: { "content-type": "application/x-www-form-urlencoded", "user-agent": CODEX_AUTH_USER_AGENT },
     body: new URLSearchParams(parameters),
   });
   if (!response.ok) {
-    const body = await response.text();
-    throw new GatewayAuthError(`OAuth token exchange failed: HTTP ${response.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
+    throw new GatewayAuthError(`OAuth token exchange failed: ${await readUpstreamError(response)}`);
   }
   const payload: unknown = await response.json();
   const accessToken = readString(payload, "access_token");
   const refreshToken = readString(payload, "refresh_token");
   const idToken = readString(payload, "id_token");
   const expiresIn = readNumber(payload, "expires_in") ?? 3600;
-  if (!accessToken || !refreshToken) throw new GatewayAuthError("OAuth token response is missing required tokens.");
+  if (!accessToken) throw new GatewayAuthError("OAuth token response is missing access_token.");
   return { accessToken, refreshToken, idToken, expiresIn };
+}
+
+async function readUpstreamError(response: Response): Promise<string> {
+  const body = await response.text();
+  if (!body) return `HTTP ${response.status}.`;
+  try {
+    const payload: unknown = JSON.parse(body);
+    const error = readString(payload, "error");
+    const description = readString(payload, "error_description");
+    if (error || description) return `HTTP ${response.status}: ${[error, description].filter(Boolean).join(" — ")}.`;
+  } catch {
+    // Keep the status-only message when the upstream body is not JSON.
+  }
+  return `HTTP ${response.status}: ${body.slice(0, 300)}.`;
+}
+
+function codexAuthHeaders(): Record<string, string> {
+  return {
+    "content-type": "application/json",
+    "user-agent": CODEX_AUTH_USER_AGENT,
+    originator: "codex_cli_rs",
+  };
 }
 
 function extractAccountId(token: string | undefined): string | undefined {
@@ -230,7 +254,7 @@ function extractAccountId(token: string | undefined): string | undefined {
 
 interface OAuthTokenResponse {
   accessToken: string;
-  refreshToken: string;
+  refreshToken?: string;
   idToken?: string;
   expiresIn: number;
 }
