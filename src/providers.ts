@@ -2,6 +2,9 @@ import { UpstreamError } from "./errors";
 import type { ChatGptToken, ChatCompletionRequest, Env, ImageEditRequest, ImageGenerationRequest } from "./types";
 import { toResponsesInput } from "./validation";
 
+const MAX_UPSTREAM_ATTEMPTS = 3;
+const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
+
 export async function createResponsesResponse(env: Env, token: ChatGptToken, request: ChatCompletionRequest): Promise<Response> {
   const body: Record<string, unknown> = {
     model: normalizeChatModel(request.model),
@@ -20,26 +23,13 @@ export async function createChatCompletionResponse(env: Env, token: ChatGptToken
 }
 
 export async function createImageResponse(env: Env, token: ChatGptToken, request: ImageGenerationRequest): Promise<Response> {
-  const body: Record<string, unknown> = {
-    model: "gpt-image-2",
-    prompt: request.prompt,
-    n: request.n ?? 1,
-    size: request.size ?? "auto",
-    quality: request.quality ?? "auto",
-  };
+  const body: Record<string, unknown> = { model: "gpt-image-2", prompt: request.prompt, n: request.n ?? 1, size: request.size ?? "auto", quality: request.quality ?? "auto" };
   if (request.background) body.background = request.background;
   return fetchCodex(`${env.CHATGPT_CODEX_IMAGES_ENDPOINT}/generations`, token, body, false);
 }
 
 export async function createImageEditResponse(env: Env, token: ChatGptToken, request: ImageEditRequest): Promise<Response> {
-  const body: Record<string, unknown> = {
-    model: "gpt-image-2",
-    prompt: request.prompt,
-    images: Array.isArray(request.image) ? request.image : [request.image],
-    n: 1,
-    size: "auto",
-    quality: "auto",
-  };
+  const body: Record<string, unknown> = { model: "gpt-image-2", prompt: request.prompt, images: Array.isArray(request.image) ? request.image : [request.image], n: 1, size: "auto", quality: "auto" };
   return fetchCodex(`${env.CHATGPT_CODEX_IMAGES_ENDPOINT}/edits`, token, body, false);
 }
 
@@ -48,18 +38,39 @@ function normalizeChatModel(model: string): string {
 }
 
 async function fetchCodex(endpoint: string, token: ChatGptToken, body: Record<string, unknown>, stream: boolean): Promise<Response> {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token.accessToken}`,
-      "chatgpt-account-id": token.accountId,
-      "content-type": "application/json",
-      Accept: stream ? "text/event-stream" : "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (response.ok) return response;
-  throw new UpstreamError(await readUpstreamError(response), response.status);
+  let lastResponse: Response | null = null;
+  for (let attempt = 1; attempt <= MAX_UPSTREAM_ATTEMPTS; attempt += 1) {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token.accessToken}`,
+        "chatgpt-account-id": token.accountId,
+        "content-type": "application/json",
+        Accept: stream ? "text/event-stream" : "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (response.ok) return response;
+    lastResponse = response;
+    if (!RETRYABLE_STATUS_CODES.has(response.status) || attempt === MAX_UPSTREAM_ATTEMPTS) break;
+    const retryAfter = readRetryAfter(response.headers.get("retry-after"));
+    await sleep(retryAfter ?? 250 * 2 ** (attempt - 1));
+  }
+  if (!lastResponse) throw new UpstreamError("No response from upstream.", 502);
+  throw new UpstreamError(await readUpstreamError(lastResponse), lastResponse.status);
+}
+
+function readRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 10_000);
+  const timestamp = Date.parse(value);
+  if (!Number.isNaN(timestamp)) return Math.min(Math.max(0, timestamp - Date.now()), 10_000);
+  return undefined;
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function readUpstreamError(response: Response): Promise<string> {
@@ -76,13 +87,7 @@ async function readUpstreamError(response: Response): Promise<string> {
 
 async function mapResponseToChatCompletion(response: Response, model: string): Promise<Response> {
   const payload: unknown = await response.json();
-  return jsonResponse({
-    id: `chatcmpl-${crypto.randomUUID()}`,
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, message: { role: "assistant", content: extractOutputText(payload) }, finish_reason: "stop" }],
-  });
+  return jsonResponse({ id: `chatcmpl-${crypto.randomUUID()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: extractOutputText(payload) }, finish_reason: "stop" }] });
 }
 
 function mapStreamToChatCompletion(response: Response, model: string): Response {
@@ -93,7 +98,6 @@ function mapStreamToChatCompletion(response: Response, model: string): Response 
   const id = `chatcmpl-${crypto.randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
   let buffer = "";
-
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       const result = await reader.read();
@@ -113,10 +117,7 @@ function mapStreamToChatCompletion(response: Response, model: string): Response 
       void reader.cancel();
     },
   });
-
-  return new Response(stream, {
-    headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" },
-  });
+  return new Response(stream, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" } });
 }
 
 function emitStreamLines(text: string, controller: ReadableStreamDefaultController<Uint8Array>, encoder: TextEncoder, id: string, created: number, model: string): void {
@@ -130,13 +131,7 @@ function emitStreamLines(text: string, controller: ReadableStreamDefaultControll
       continue;
     }
     if (!isRecord(payload) || payload.type !== "response.output_text.delta" || typeof payload.delta !== "string") continue;
-    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model,
-      choices: [{ index: 0, delta: { content: payload.delta }, finish_reason: null }],
-    })}\n\n`));
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: payload.delta }, finish_reason: null }] })}\n\n`));
   }
 }
 
