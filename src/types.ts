@@ -1,6 +1,7 @@
 export interface Env {
   GATEWAY_API_KEY: string;
-  GATEWAY_ADMIN_KEY: string;
+  ADMIN_USERNAME: string;
+  ADMIN_PASSWORD: string;
   CHATGPT_CODEX_ENDPOINT: string;
   CHATGPT_CODEX_IMAGES_ENDPOINT: string;
   CHATGPT_AUTH_BASE_URL: string;
