@@ -1,63 +1,57 @@
 # ChatGPT Gateway
 
-OpenAI-compatible Cloudflare Worker gateway for ChatGPT/Codex subscription access.
+Cloudflare Worker gateway that exposes a small OpenAI-compatible API surface for ChatGPT/Codex upstreams.
 
 ## Capabilities
 
-- Chat via ChatGPT/Codex Responses
+- Chat + Responses
 - SSE streaming
-- Web Search tool
-- GPT Image generation
-- GPT Image editing
-- ChatGPT device-code login
-- Encrypted OAuth credential storage in Cloudflare D1
+- Web Search through the Responses `web_search` tool
+- GPT Image generation and editing
+- Device-code authentication boundary
+- Encrypted credential persistence in D1
 - Automatic access-token refresh
-- Account rotation foundation
-
-The authentication flow follows the current Codex device login: request a device code, send the user to `https://auth.openai.com/codex/device`, poll for an authorization code, then exchange it at `https://auth.openai.com/oauth/token`. Codex itself documents the same device-code sequence and persists/refreshed ChatGPT OAuth credentials. citeturn2view0turn1search7
+- Per-client rate limiting
+- Usage and latency metrics
+- Upstream retry/backoff for transient 429/502/503/504 responses
 
 ## Architecture
 
 ```text
 Admin
   │
-  ├── POST /auth/device/start
-  │       ↓
-  │   OpenAI device code
-  │       ↓
-  │   https://auth.openai.com/codex/device
-  │       ↓
-  └── POST /auth/device/poll
-          ↓
-       OAuth tokens
-          ↓
-       AES-256-GCM
-          ↓
-      Cloudflare D1
+  ├── /auth/device/start
+  ├── ChatGPT device login
+  └── /auth/device/poll
           │
           ▼
-Client ── API key ──► Cloudflare Worker
-                         │
-                         ├── Chat
-                         ├── Web Search
-                         ├── Image
-                         └── Image Edit
-                         │
-                         ▼
-                  ChatGPT/Codex backend
-```
+      OAuth credential store
+          │
+          ▼
+      Cloudflare D1
 
-OAuth refresh tokens are encrypted before persistence. The encryption key is a Wrangler secret and never enters D1.
+Client ── API key ──► Worker
+                         │
+                         ├── validation
+                         ├── rate limit
+                         ├── request metrics
+                         └── provider adapter
+                                  │
+                                  ├── Chat / Responses
+                                  ├── Web Search
+                                  └── GPT Image
+```
 
 ## Endpoints
 
-### Public health
+### Health
 
 `GET /health`
 
 ### API
 
 - `GET /v1/models`
+- `GET /v1/usage`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/images/generations`
@@ -69,7 +63,7 @@ API authentication:
 Authorization: Bearer $GATEWAY_API_KEY
 ```
 
-### Admin authentication
+### Admin
 
 - `POST /auth/device/start`
 - `POST /auth/device/poll`
@@ -82,19 +76,18 @@ Admin authentication:
 Authorization: Bearer $GATEWAY_ADMIN_KEY
 ```
 
-## ChatGPT login
+## Login flow
 
-1. Deploy the Worker and run the D1 migration.
-2. Call:
+1. Deploy the Worker and D1 schema.
+2. Start a device login:
 
 ```bash
 curl -X POST https://YOUR_GATEWAY/auth/device/start \
   -H "Authorization: Bearer $GATEWAY_ADMIN_KEY"
 ```
 
-3. Open the returned `verification_url`.
-4. Enter the returned `user_code`.
-5. Poll until `status` becomes `completed`:
+3. Open the returned `verification_url` and enter `user_code`.
+4. Poll the login session:
 
 ```bash
 curl -X POST https://YOUR_GATEWAY/auth/device/poll \
@@ -103,23 +96,27 @@ curl -X POST https://YOUR_GATEWAY/auth/device/poll \
   -d '{"login_id":"LOGIN_ID","label":"primary"}'
 ```
 
-After completion, the Worker owns the ChatGPT OAuth credentials. You do **not** copy `auth.json`, access tokens, or refresh tokens into Worker variables.
+5. Continue polling until `status` is `completed`.
+
+The gateway keeps credential material server-side and never exposes it through the account-management endpoints.
 
 ## Cloudflare setup
 
-Create the D1 database:
+Create D1:
 
 ```bash
 npx wrangler d1 create chatgpt-gateway
 ```
 
-Put the returned database ID into `wrangler.toml`, then run:
+Set the returned `database_id` in `wrangler.toml` and apply migrations:
 
 ```bash
 npx wrangler d1 migrations apply chatgpt-gateway --remote
 ```
 
-Create secrets:
+For an existing deployment that already applied `0001_auth.sql`, the observability tables must also be applied once. The definitions are included in `0001_auth.sql` for fresh databases; for an already migrated database, run the equivalent `usage_events` and `rate_limits` table definitions manually before enabling strict rate limiting.
+
+Secrets:
 
 ```bash
 npx wrangler secret put GATEWAY_API_KEY
@@ -127,15 +124,13 @@ npx wrangler secret put GATEWAY_ADMIN_KEY
 npx wrangler secret put CHATGPT_TOKEN_ENCRYPTION_KEY
 ```
 
-Generate the encryption key with:
+Generate the encryption key:
 
 ```bash
 openssl rand -hex 32
 ```
 
-`CHATGPT_OAUTH_CLIENT_ID` is configured as a non-secret public OAuth client identifier. The current Codex implementation uses `app_EMoamEEZ73f0CkXaXp7hrann`. citeturn3search4turn3search2
-
-## API example
+## Chat
 
 ```bash
 curl https://YOUR_GATEWAY/v1/chat/completions \
@@ -148,18 +143,22 @@ curl https://YOUR_GATEWAY/v1/chat/completions \
   }'
 ```
 
-Web Search:
+## Web Search
 
 ```json
 {
   "model": "chatgpt-gpt-5.6",
-  "messages": [{"role": "user", "content": "What happened in Vietnam today?"}],
+  "messages": [
+    {"role": "user", "content": "What are the latest technology news today?"}
+  ],
   "web_search": true,
   "stream": true
 }
 ```
 
-Image generation:
+The gateway maps `web_search: true` to the upstream Responses `web_search` tool.
+
+## Image generation
 
 ```bash
 curl https://YOUR_GATEWAY/v1/images/generations \
@@ -171,18 +170,32 @@ curl https://YOUR_GATEWAY/v1/images/generations \
   }'
 ```
 
-## Security model
+## Usage
 
-- API key and admin key are separate credentials.
-- Refresh/access/id tokens are encrypted with AES-256-GCM at rest.
-- Tokens are never returned by `/auth/accounts`.
-- OAuth device sessions expire after 15 minutes.
-- Access tokens are refreshed inside the Worker when they approach expiry.
-- Refresh-token rotation is persisted after successful refresh.
+```bash
+curl https://YOUR_GATEWAY/v1/usage \
+  -H "Authorization: Bearer $GATEWAY_API_KEY"
+```
+
+The summary covers the last seven days and reports request count, success count, failure count, and average latency. No prompts or response bodies are stored.
+
+## Reliability
+
+Transient upstream statuses `429`, `502`, `503`, and `504` are retried up to three attempts with exponential backoff and `Retry-After` support. Streaming requests are only retried before a successful upstream response is established.
+
+## Security
+
+- API and admin credentials are separate.
+- Stored credential material is encrypted at rest with AES-256-GCM.
+- Account listings never return access or refresh tokens.
+- Device login sessions expire.
+- Rate-limit keys are SHA-256 derived; raw API credentials are not written to metrics.
+- Usage telemetry stores route/model/status/latency only.
+- CORS is permissive by default; restrict it before exposing browser clients.
 
 ## Important limitation
 
-ChatGPT/Codex endpoints are private, undocumented service endpoints rather than the public OpenAI API. They can change without notice. The gateway therefore keeps the upstream protocol isolated in `src/providers.ts` and authentication isolated in `src/chatgpt-auth.ts`.
+The ChatGPT/Codex upstream endpoints used by this project are private service endpoints rather than the public OpenAI API. They can change without notice. Upstream protocol code is isolated in `src/providers.ts`, while authentication is isolated in `src/chatgpt-auth.ts`.
 
 ## Local checks
 
