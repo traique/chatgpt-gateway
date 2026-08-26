@@ -11,7 +11,7 @@ CHATGPT_CODEX_IMAGES_ENDPOINT = "https://chatgpt.com/backend-api/codex/images"
 [[d1_databases]]
 binding = "DB"
 database_name = "chatgpt-gateway"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = b06402d1-adba-4a96-a022-42b26d478a4c
 migrations_dir = "migrations"
 
 # Secrets:
