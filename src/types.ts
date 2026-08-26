@@ -29,6 +29,25 @@ export interface ChatCompletionRequest {
   webSearch: boolean;
 }
 
+export interface ResponsesRequest {
+  model: string;
+  input: string | ResponsesInputItem[];
+  instructions?: string;
+  stream: boolean;
+  maxOutputTokens?: number;
+  webSearch: boolean;
+}
+
+export interface ResponsesInputItem {
+  role: "developer" | "system" | "user" | "assistant";
+  content: string | ResponsesContentItem[];
+}
+
+export interface ResponsesContentItem {
+  type: "input_text" | "output_text";
+  text: string;
+}
+
 export interface ImageGenerationRequest {
   model: string;
   prompt: string;
