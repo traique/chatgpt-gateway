@@ -1,0 +1,20 @@
+name = "chatgpt-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-08-26"
+
+[vars]
+CHATGPT_AUTH_BASE_URL = "https://auth.openai.com"
+CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CHATGPT_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+CHATGPT_CODEX_IMAGES_ENDPOINT = "https://chatgpt.com/backend-api/codex/images"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "chatgpt-gateway"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Secrets:
+# wrangler secret put GATEWAY_API_KEY
+# wrangler secret put GATEWAY_ADMIN_KEY
+# wrangler secret put CHATGPT_TOKEN_ENCRYPTION_KEY
