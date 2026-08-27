@@ -3,6 +3,7 @@ import { disableAccount, getChatGptToken, listAccounts, pollDeviceLogin, startDe
 import { GatewayRequestError, UpstreamError } from "./errors";
 import { createChatCompletionResponse, createImageEditResponse, createImageResponse, createResponsesResponse, diagnoseCodexUpstream } from "./providers";
 import { probeResolveOverrides } from "./resolve-override";
+import { probeWorkerTransports } from "./transport-debug";
 import { createRequestContext, enforceRateLimit, getUsageSummary, recordUsage } from "./observability";
 import { validateChatRequest, validateImageEditRequest, validateImageGenerationRequest, validateResponsesRequest } from "./validation";
 import type { Env } from "./types";
@@ -25,102 +26,19 @@ export default {
     if (request.method === "GET" && url.pathname === "/v1/usage") return json(await getUsageSummary(env));
     if (request.method === "GET" && url.pathname === "/v1/debug/upstream") return debugUpstreamResponse(env);
     if (request.method === "GET" && url.pathname === "/v1/debug/resolve-override") return debugResolveOverrideResponse(env);
+    if (request.method === "GET" && url.pathname === "/v1/debug/transport") return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", checks: await probeWorkerTransports() });
     if (request.method !== "POST") return errorResponse("invalid_request_error", "Method not allowed.", 405);
     return handleApiRequest(request, env, url);
   },
 } satisfies ExportedHandler<Env>;
 
-async function debugUpstreamResponse(env: Env): Promise<Response> {
-  try {
-    const token = await getChatGptToken(env);
-    return json(await diagnoseCodexUpstream(env, token));
-  } catch (error) {
-    return mapError(error);
-  }
-}
-
-async function debugResolveOverrideResponse(env: Env): Promise<Response> {
-  try {
-    const endpoint = new URL(env.CHATGPT_CODEX_ENDPOINT);
-    return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", target_host: endpoint.hostname, checks: await probeResolveOverrides(endpoint.hostname) });
-  } catch (error) {
-    return mapError(error);
-  }
-}
-
-async function healthResponse(env: Env): Promise<Response> {
-  let databaseConfigured = false;
-  try {
-    await env.DB.prepare("SELECT 1").first();
-    databaseConfigured = true;
-  } catch {
-    databaseConfigured = false;
-  }
-  const diagnostics = {
-    api_key_configured: Boolean(env.GATEWAY_API_KEY?.trim()),
-    admin_credentials_configured: Boolean(env.ADMIN_USERNAME?.trim() && env.ADMIN_PASSWORD?.trim()),
-    encryption_key_configured: Boolean(env.CHATGPT_TOKEN_ENCRYPTION_KEY?.trim()),
-    database_configured: databaseConfigured,
-  };
-  return json({ ok: Object.values(diagnostics).every(Boolean), service: "chatgpt-gateway", diagnostics }, Object.values(diagnostics).every(Boolean) ? 200 : 503);
-}
-
-async function handleApiRequest(request: Request, env: Env, url: URL): Promise<Response> {
-  const context = createRequestContext();
-  const rateLimit = await enforceRateLimit(env, await hashClientKey(request), API_RATE_LIMIT);
-  if (!rateLimit.allowed) return rateLimitResponse(rateLimit.resetAt);
-  try {
-    const payload: unknown = await request.json();
-    const token = await getChatGptToken(env);
-    const response = await routeApiRequest(url.pathname, env, token, payload);
-    await recordUsage(env, url.pathname, readModel(payload), response.status, Date.now() - context.startedAt, token.accountId);
-    return withRateLimitHeaders(response, rateLimit.remaining, rateLimit.resetAt);
-  } catch (error) {
-    const response = mapError(error);
-    await recordUsage(env, url.pathname, "unknown", response.status, Date.now() - context.startedAt);
-    return withRateLimitHeaders(response, rateLimit.remaining, rateLimit.resetAt);
-  }
-}
-
-async function routeApiRequest(pathname: string, env: Env, token: Awaited<ReturnType<typeof getChatGptToken>>, payload: unknown): Promise<Response> {
-  if (pathname === "/v1/chat/completions") return proxyResponse(await createChatCompletionResponse(env, token, validateChatRequest(payload)));
-  if (pathname === "/v1/responses") return proxyResponse(await createResponsesResponse(env, token, validateResponsesRequest(payload)));
-  if (pathname === "/v1/images/generations") return proxyResponse(await createImageResponse(env, token, validateImageGenerationRequest(payload)));
-  if (pathname === "/v1/images/edits") return proxyResponse(await createImageEditResponse(env, token, validateImageEditRequest(payload)));
-  throw new GatewayRequestError("Unknown endpoint.");
-}
-
-async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Response> {
-  if (request.method === "POST" && url.pathname === "/auth/login") return loginAdmin(request, env);
-  if (request.method === "POST" && url.pathname === "/auth/logout") return logoutAdmin(request, env);
-  if (request.method === "GET" && url.pathname === "/auth/me") return adminMe(request, env);
-  if (request.method === "POST" && url.pathname === "/auth/api-key-check") return apiKeyCheck(request, env);
-  const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request));
-  if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401);
-  if (request.method === "POST" && url.pathname === "/auth/device/start") return startDeviceAuth(env);
-  if (request.method === "POST" && url.pathname === "/auth/device/poll") return pollDeviceAuth(request, env);
-  if (request.method === "GET" && url.pathname === "/auth/accounts") return json({ data: await listAccounts(env) });
-  if (request.method === "DELETE" && url.pathname.startsWith("/auth/accounts/")) {
-    const accountId = url.pathname.split("/").pop();
-    if (!accountId) return errorResponse("invalid_request_error", "Account ID is required.", 400);
-    await disableAccount(env, accountId);
-    return json({ ok: true });
-  }
-  return errorResponse("invalid_request_error", "Unknown authentication endpoint.", 404);
-}
-
-async function apiKeyCheck(request: Request, env: Env): Promise<Response> {
-  const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request));
-  if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401);
-  try {
-    const payload: unknown = await request.json();
-    if (!isRecord(payload) || typeof payload.api_key !== "string") return errorResponse("invalid_request_error", "api_key is required.", 400);
-    const receivedKey = payload.api_key.trim(); const configuredKey = env.GATEWAY_API_KEY?.trim() ?? "";
-    const [receivedFingerprint, configuredFingerprint] = await Promise.all([fingerprint(receivedKey), fingerprint(configuredKey)]);
-    return json({ match: Boolean(receivedKey && configuredKey && receivedKey === configuredKey), received_key_length: receivedKey.length, configured_key_length: configuredKey.length, received_key_sha256: receivedFingerprint, configured_key_sha256: configuredFingerprint });
-  } catch (error) { return mapError(error); }
-}
-
+async function debugUpstreamResponse(env: Env): Promise<Response> { try { const token = await getChatGptToken(env); return json(await diagnoseCodexUpstream(env, token)); } catch (error) { return mapError(error); } }
+async function debugResolveOverrideResponse(env: Env): Promise<Response> { try { const endpoint = new URL(env.CHATGPT_CODEX_ENDPOINT); return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", target_host: endpoint.hostname, checks: await probeResolveOverrides(endpoint.hostname) }); } catch (error) { return mapError(error); } }
+async function healthResponse(env: Env): Promise<Response> { let databaseConfigured = false; try { await env.DB.prepare("SELECT 1").first(); databaseConfigured = true; } catch { databaseConfigured = false; } const diagnostics = { api_key_configured: Boolean(env.GATEWAY_API_KEY?.trim()), admin_credentials_configured: Boolean(env.ADMIN_USERNAME?.trim() && env.ADMIN_PASSWORD?.trim()), encryption_key_configured: Boolean(env.CHATGPT_TOKEN_ENCRYPTION_KEY?.trim()), database_configured: databaseConfigured }; return json({ ok: Object.values(diagnostics).every(Boolean), service: "chatgpt-gateway", diagnostics }, Object.values(diagnostics).every(Boolean) ? 200 : 503); }
+async function handleApiRequest(request: Request, env: Env, url: URL): Promise<Response> { const context = createRequestContext(); const rateLimit = await enforceRateLimit(env, await hashClientKey(request), API_RATE_LIMIT); if (!rateLimit.allowed) return rateLimitResponse(rateLimit.resetAt); try { const payload: unknown = await request.json(); const token = await getChatGptToken(env); const response = await routeApiRequest(url.pathname, env, token, payload); await recordUsage(env, url.pathname, readModel(payload), response.status, Date.now() - context.startedAt, token.accountId); return withRateLimitHeaders(response, rateLimit.remaining, rateLimit.resetAt); } catch (error) { const response = mapError(error); await recordUsage(env, url.pathname, "unknown", response.status, Date.now() - context.startedAt); return withRateLimitHeaders(response, rateLimit.remaining, rateLimit.resetAt); } }
+async function routeApiRequest(pathname: string, env: Env, token: Awaited<ReturnType<typeof getChatGptToken>>, payload: unknown): Promise<Response> { if (pathname === "/v1/chat/completions") return proxyResponse(await createChatCompletionResponse(env, token, validateChatRequest(payload))); if (pathname === "/v1/responses") return proxyResponse(await createResponsesResponse(env, token, validateResponsesRequest(payload))); if (pathname === "/v1/images/generations") return proxyResponse(await createImageResponse(env, token, validateImageGenerationRequest(payload))); if (pathname === "/v1/images/edits") return proxyResponse(await createImageEditResponse(env, token, validateImageEditRequest(payload))); throw new GatewayRequestError("Unknown endpoint."); }
+async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Response> { if (request.method === "POST" && url.pathname === "/auth/login") return loginAdmin(request, env); if (request.method === "POST" && url.pathname === "/auth/logout") return logoutAdmin(request, env); if (request.method === "GET" && url.pathname === "/auth/me") return adminMe(request, env); if (request.method === "POST" && url.pathname === "/auth/api-key-check") return apiKeyCheck(request, env); const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request)); if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401); if (request.method === "POST" && url.pathname === "/auth/device/start") return startDeviceAuth(env); if (request.method === "POST" && url.pathname === "/auth/device/poll") return pollDeviceAuth(request, env); if (request.method === "GET" && url.pathname === "/auth/accounts") return json({ data: await listAccounts(env) }); if (request.method === "DELETE" && url.pathname.startsWith("/auth/accounts/")) { const accountId = url.pathname.split("/").pop(); if (!accountId) return errorResponse("invalid_request_error", "Account ID is required.", 400); await disableAccount(env, accountId); return json({ ok: true }); } return errorResponse("invalid_request_error", "Unknown authentication endpoint.", 404); }
+async function apiKeyCheck(request: Request, env: Env): Promise<Response> { const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request)); if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401); try { const payload: unknown = await request.json(); if (!isRecord(payload) || typeof payload.api_key !== "string") return errorResponse("invalid_request_error", "api_key is required.", 400); const receivedKey = payload.api_key.trim(); const configuredKey = env.GATEWAY_API_KEY?.trim() ?? ""; const [receivedFingerprint, configuredFingerprint] = await Promise.all([fingerprint(receivedKey), fingerprint(configuredKey)]); return json({ match: Boolean(receivedKey && configuredKey && receivedKey === configuredKey), received_key_length: receivedKey.length, configured_key_length: configuredKey.length, received_key_sha256: receivedFingerprint, configured_key_sha256: configuredFingerprint }); } catch (error) { return mapError(error); } }
 async function loginAdmin(request: Request, env: Env): Promise<Response> { try { const payload: unknown = await request.json(); if (!isRecord(payload) || typeof payload.username !== "string" || typeof payload.password !== "string") return errorResponse("invalid_request_error", "Username and password are required.", 400); const token = await authenticateAdmin(env, payload.username, payload.password); if (!token) return errorResponse("authentication_error", "Sai tài khoản hoặc mật khẩu.", 401); await cleanupAdminSessions(env); return json({ ok: true }, 200, sessionCookie(token)); } catch (error) { return mapError(error); } }
 async function logoutAdmin(request: Request, env: Env): Promise<Response> { await revokeAdminSession(env, readAdminSessionCookie(request)); return json({ ok: true }, 200, expiredSessionCookie()); }
 async function adminMe(request: Request, env: Env): Promise<Response> { return json({ authenticated: await isAdminSessionValid(env, readAdminSessionCookie(request)) }); }
