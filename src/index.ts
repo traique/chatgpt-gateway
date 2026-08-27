@@ -2,6 +2,7 @@ import { authenticateAdmin, ADMIN_SESSION_COOKIE, cleanupAdminSessions, isAdminS
 import { disableAccount, getChatGptToken, listAccounts, pollDeviceLogin, startDeviceLogin } from "./auth";
 import { GatewayRequestError, UpstreamError } from "./errors";
 import { createChatCompletionResponse, createImageEditResponse, createImageResponse, createResponsesResponse, diagnoseCodexUpstream } from "./providers";
+import { probeResolveOverrides } from "./resolve-override";
 import { createRequestContext, enforceRateLimit, getUsageSummary, recordUsage } from "./observability";
 import { validateChatRequest, validateImageEditRequest, validateImageGenerationRequest, validateResponsesRequest } from "./validation";
 import type { Env } from "./types";
@@ -23,6 +24,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/v1/models") return modelsResponse();
     if (request.method === "GET" && url.pathname === "/v1/usage") return json(await getUsageSummary(env));
     if (request.method === "GET" && url.pathname === "/v1/debug/upstream") return debugUpstreamResponse(env);
+    if (request.method === "GET" && url.pathname === "/v1/debug/resolve-override") return debugResolveOverrideResponse(env);
     if (request.method !== "POST") return errorResponse("invalid_request_error", "Method not allowed.", 405);
     return handleApiRequest(request, env, url);
   },
@@ -37,6 +39,15 @@ async function debugUpstreamResponse(env: Env): Promise<Response> {
   }
 }
 
+async function debugResolveOverrideResponse(env: Env): Promise<Response> {
+  try {
+    const endpoint = new URL(env.CHATGPT_CODEX_ENDPOINT);
+    return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", target_host: endpoint.hostname, checks: await probeResolveOverrides(endpoint.hostname) });
+  } catch (error) {
+    return mapError(error);
+  }
+}
+
 async function healthResponse(env: Env): Promise<Response> {
   let databaseConfigured = false;
   try {
@@ -45,14 +56,12 @@ async function healthResponse(env: Env): Promise<Response> {
   } catch {
     databaseConfigured = false;
   }
-
   const diagnostics = {
     api_key_configured: Boolean(env.GATEWAY_API_KEY?.trim()),
     admin_credentials_configured: Boolean(env.ADMIN_USERNAME?.trim() && env.ADMIN_PASSWORD?.trim()),
     encryption_key_configured: Boolean(env.CHATGPT_TOKEN_ENCRYPTION_KEY?.trim()),
     database_configured: databaseConfigured,
   };
-
   return json({ ok: Object.values(diagnostics).every(Boolean), service: "chatgpt-gateway", diagnostics }, Object.values(diagnostics).every(Boolean) ? 200 : 503);
 }
 
@@ -86,7 +95,6 @@ async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Re
   if (request.method === "POST" && url.pathname === "/auth/logout") return logoutAdmin(request, env);
   if (request.method === "GET" && url.pathname === "/auth/me") return adminMe(request, env);
   if (request.method === "POST" && url.pathname === "/auth/api-key-check") return apiKeyCheck(request, env);
-
   const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request));
   if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401);
   if (request.method === "POST" && url.pathname === "/auth/device/start") return startDeviceAuth(env);
@@ -113,15 +121,7 @@ async function apiKeyCheck(request: Request, env: Env): Promise<Response> {
   } catch (error) { return mapError(error); }
 }
 
-async function loginAdmin(request: Request, env: Env): Promise<Response> {
-  try {
-    const payload: unknown = await request.json();
-    if (!isRecord(payload) || typeof payload.username !== "string" || typeof payload.password !== "string") return errorResponse("invalid_request_error", "Username and password are required.", 400);
-    const token = await authenticateAdmin(env, payload.username, payload.password);
-    if (!token) return errorResponse("authentication_error", "Sai tài khoản hoặc mật khẩu.", 401);
-    await cleanupAdminSessions(env); return json({ ok: true }, 200, sessionCookie(token));
-  } catch (error) { return mapError(error); }
-}
+async function loginAdmin(request: Request, env: Env): Promise<Response> { try { const payload: unknown = await request.json(); if (!isRecord(payload) || typeof payload.username !== "string" || typeof payload.password !== "string") return errorResponse("invalid_request_error", "Username and password are required.", 400); const token = await authenticateAdmin(env, payload.username, payload.password); if (!token) return errorResponse("authentication_error", "Sai tài khoản hoặc mật khẩu.", 401); await cleanupAdminSessions(env); return json({ ok: true }, 200, sessionCookie(token)); } catch (error) { return mapError(error); } }
 async function logoutAdmin(request: Request, env: Env): Promise<Response> { await revokeAdminSession(env, readAdminSessionCookie(request)); return json({ ok: true }, 200, expiredSessionCookie()); }
 async function adminMe(request: Request, env: Env): Promise<Response> { return json({ authenticated: await isAdminSessionValid(env, readAdminSessionCookie(request)) }); }
 function sessionCookie(token: string): Record<string, string> { return { "set-cookie": `${ADMIN_SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=43200` }; }
