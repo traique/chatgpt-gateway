@@ -155,7 +155,8 @@ function isAuthorized(request: Request, env: Env): boolean {
   const authorization = request.headers.get("authorization") ?? "";
   const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
   const apiKey = bearer ?? request.headers.get("x-api-key")?.trim();
-  return Boolean(apiKey && apiKey === env.GATEWAY_API_KEY);
+  const configuredApiKey = env.GATEWAY_API_KEY?.trim();
+  return Boolean(apiKey && configuredApiKey && apiKey === configuredApiKey);
 }
 
 async function proxyResponse(response: Response): Promise<Response> {
