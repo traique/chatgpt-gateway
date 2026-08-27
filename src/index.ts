@@ -1,7 +1,7 @@
 import { authenticateAdmin, ADMIN_SESSION_COOKIE, cleanupAdminSessions, isAdminSessionValid, revokeAdminSession } from "./admin-auth";
 import { disableAccount, getChatGptToken, listAccounts, pollDeviceLogin, startDeviceLogin } from "./auth";
 import { GatewayRequestError, UpstreamError } from "./errors";
-import { createChatCompletionResponse, createImageEditResponse, createImageResponse, createResponsesResponse } from "./providers";
+import { createChatCompletionResponse, createImageEditResponse, createImageResponse, createResponsesResponse, diagnoseCodexUpstream } from "./providers";
 import { createRequestContext, enforceRateLimit, getUsageSummary, recordUsage } from "./observability";
 import { validateChatRequest, validateImageEditRequest, validateImageGenerationRequest, validateResponsesRequest } from "./validation";
 import type { Env } from "./types";
@@ -22,10 +22,20 @@ export default {
     if (!isAuthorized(request, env)) return errorResponse("authentication_error", "Invalid API key.", 401);
     if (request.method === "GET" && url.pathname === "/v1/models") return modelsResponse();
     if (request.method === "GET" && url.pathname === "/v1/usage") return json(await getUsageSummary(env));
+    if (request.method === "GET" && url.pathname === "/v1/debug/upstream") return debugUpstreamResponse(env);
     if (request.method !== "POST") return errorResponse("invalid_request_error", "Method not allowed.", 405);
     return handleApiRequest(request, env, url);
   },
 } satisfies ExportedHandler<Env>;
+
+async function debugUpstreamResponse(env: Env): Promise<Response> {
+  try {
+    const token = await getChatGptToken(env);
+    return json(await diagnoseCodexUpstream(env, token));
+  } catch (error) {
+    return mapError(error);
+  }
+}
 
 async function healthResponse(env: Env): Promise<Response> {
   let databaseConfigured = false;
@@ -43,11 +53,7 @@ async function healthResponse(env: Env): Promise<Response> {
     database_configured: databaseConfigured,
   };
 
-  return json({
-    ok: Object.values(diagnostics).every(Boolean),
-    service: "chatgpt-gateway",
-    diagnostics,
-  }, Object.values(diagnostics).every(Boolean) ? 200 : 503);
+  return json({ ok: Object.values(diagnostics).every(Boolean), service: "chatgpt-gateway", diagnostics }, Object.values(diagnostics).every(Boolean) ? 200 : 503);
 }
 
 async function handleApiRequest(request: Request, env: Env, url: URL): Promise<Response> {
@@ -83,7 +89,6 @@ async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Re
 
   const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request));
   if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401);
-
   if (request.method === "POST" && url.pathname === "/auth/device/start") return startDeviceAuth(env);
   if (request.method === "POST" && url.pathname === "/auth/device/poll") return pollDeviceAuth(request, env);
   if (request.method === "GET" && url.pathname === "/auth/accounts") return json({ data: await listAccounts(env) });
@@ -99,121 +104,36 @@ async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Re
 async function apiKeyCheck(request: Request, env: Env): Promise<Response> {
   const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request));
   if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401);
-
   try {
     const payload: unknown = await request.json();
-    if (!isRecord(payload) || typeof payload.api_key !== "string") {
-      return errorResponse("invalid_request_error", "api_key is required.", 400);
-    }
-
-    const receivedKey = payload.api_key.trim();
-    const configuredKey = env.GATEWAY_API_KEY?.trim() ?? "";
-    const [receivedFingerprint, configuredFingerprint] = await Promise.all([
-      fingerprint(receivedKey),
-      fingerprint(configuredKey),
-    ]);
-
-    return json({
-      match: Boolean(receivedKey && configuredKey && receivedKey === configuredKey),
-      received_key_length: receivedKey.length,
-      configured_key_length: configuredKey.length,
-      received_key_sha256: receivedFingerprint,
-      configured_key_sha256: configuredFingerprint,
-    });
-  } catch (error) {
-    return mapError(error);
-  }
+    if (!isRecord(payload) || typeof payload.api_key !== "string") return errorResponse("invalid_request_error", "api_key is required.", 400);
+    const receivedKey = payload.api_key.trim(); const configuredKey = env.GATEWAY_API_KEY?.trim() ?? "";
+    const [receivedFingerprint, configuredFingerprint] = await Promise.all([fingerprint(receivedKey), fingerprint(configuredKey)]);
+    return json({ match: Boolean(receivedKey && configuredKey && receivedKey === configuredKey), received_key_length: receivedKey.length, configured_key_length: configuredKey.length, received_key_sha256: receivedFingerprint, configured_key_sha256: configuredFingerprint });
+  } catch (error) { return mapError(error); }
 }
 
 async function loginAdmin(request: Request, env: Env): Promise<Response> {
   try {
     const payload: unknown = await request.json();
-    if (!isRecord(payload) || typeof payload.username !== "string" || typeof payload.password !== "string") {
-      return errorResponse("invalid_request_error", "Username and password are required.", 400);
-    }
+    if (!isRecord(payload) || typeof payload.username !== "string" || typeof payload.password !== "string") return errorResponse("invalid_request_error", "Username and password are required.", 400);
     const token = await authenticateAdmin(env, payload.username, payload.password);
     if (!token) return errorResponse("authentication_error", "Sai tài khoản hoặc mật khẩu.", 401);
-    await cleanupAdminSessions(env);
-    return json({ ok: true }, 200, sessionCookie(token));
-  } catch (error) {
-    return mapError(error);
-  }
-}
-
-async function logoutAdmin(request: Request, env: Env): Promise<Response> {
-  await revokeAdminSession(env, readAdminSessionCookie(request));
-  return json({ ok: true }, 200, expiredSessionCookie());
-}
-
-async function adminMe(request: Request, env: Env): Promise<Response> {
-  const valid = await isAdminSessionValid(env, readAdminSessionCookie(request));
-  return json({ authenticated: valid });
-}
-
-function sessionCookie(token: string): Record<string, string> {
-  return { "set-cookie": `${ADMIN_SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=43200` };
-}
-
-function expiredSessionCookie(): Record<string, string> {
-  return { "set-cookie": `${ADMIN_SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0` };
-}
-
-function readAdminSessionCookie(request: Request): string | null {
-  const cookieHeader = request.headers.get("cookie") ?? "";
-  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${ADMIN_SESSION_COOKIE}=([^;]+)`));
-  return match?.[1] ?? null;
-}
-
-async function startDeviceAuth(env: Env): Promise<Response> {
-  try {
-    const session = await startDeviceLogin(env);
-    return json({ login_id: session.id, verification_url: DEVICE_VERIFICATION_URL, user_code: session.userCode, interval_seconds: session.intervalSeconds, expires_at: session.expiresAt });
+    await cleanupAdminSessions(env); return json({ ok: true }, 200, sessionCookie(token));
   } catch (error) { return mapError(error); }
 }
-
-async function pollDeviceAuth(request: Request, env: Env): Promise<Response> {
-  try {
-    const payload: unknown = await request.json();
-    if (!isRecord(payload) || typeof payload.login_id !== "string") return errorResponse("invalid_request_error", "login_id is required.", 400);
-    const label = typeof payload.label === "string" ? payload.label : "";
-    const session = await pollDeviceLogin(env, payload.login_id, label);
-    return json({ login_id: session.id, status: session.status });
-  } catch (error) { return mapError(error); }
-}
-
-function isAuthorized(request: Request, env: Env): boolean {
-  const authorization = request.headers.get("authorization") ?? "";
-  const bearer = authorization.match(/^Bearer\\s+(.+)$/i)?.[1]?.trim();
-  const apiKey = bearer ?? request.headers.get("x-api-key")?.trim();
-  const configuredApiKey = env.GATEWAY_API_KEY?.trim();
-  return Boolean(apiKey && configuredApiKey && apiKey === configuredApiKey);
-}
-
-async function fingerprint(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function proxyResponse(response: Response): Promise<Response> {
-  const headers = new Headers(response.headers);
-  for (const [key, value] of Object.entries(corsHeaders())) headers.set(key, value);
-  headers.delete("content-length");
-  return new Response(response.body, { status: response.status, headers });
-}
-
-function modelsResponse(): Response {
-  const created = Math.floor(Date.now() / 1000);
-  return json({ object: "list", data: [{ id: DEFAULT_CHAT_MODEL, object: "model", created, owned_by: "openai-chatgpt" }, { id: IMAGE_MODEL, object: "model", created, owned_by: "openai-chatgpt" }] });
-}
-
-function mapError(error: unknown): Response {
-  if (error instanceof GatewayRequestError) return errorResponse(error.type, error.message, error.status);
-  if (error instanceof UpstreamError) return errorResponse(error.type, error.message, error.status);
-  if (error instanceof SyntaxError) return errorResponse("invalid_request_error", "Request body must be valid JSON.", 400);
-  const message = error instanceof Error ? error.message : "Unexpected gateway error.";
-  return errorResponse("server_error", message, 500);
-}
-
+async function logoutAdmin(request: Request, env: Env): Promise<Response> { await revokeAdminSession(env, readAdminSessionCookie(request)); return json({ ok: true }, 200, expiredSessionCookie()); }
+async function adminMe(request: Request, env: Env): Promise<Response> { return json({ authenticated: await isAdminSessionValid(env, readAdminSessionCookie(request)) }); }
+function sessionCookie(token: string): Record<string, string> { return { "set-cookie": `${ADMIN_SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=43200` }; }
+function expiredSessionCookie(): Record<string, string> { return { "set-cookie": `${ADMIN_SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0` }; }
+function readAdminSessionCookie(request: Request): string | null { const cookieHeader = request.headers.get("cookie") ?? ""; const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${ADMIN_SESSION_COOKIE}=([^;]+)`)); return match?.[1] ?? null; }
+async function startDeviceAuth(env: Env): Promise<Response> { try { const session = await startDeviceLogin(env); return json({ login_id: session.id, verification_url: DEVICE_VERIFICATION_URL, user_code: session.userCode, interval_seconds: session.intervalSeconds, expires_at: session.expiresAt }); } catch (error) { return mapError(error); } }
+async function pollDeviceAuth(request: Request, env: Env): Promise<Response> { try { const payload: unknown = await request.json(); if (!isRecord(payload) || typeof payload.login_id !== "string") return errorResponse("invalid_request_error", "login_id is required.", 400); const label = typeof payload.label === "string" ? payload.label : ""; const session = await pollDeviceLogin(env, payload.login_id, label); return json({ login_id: session.id, status: session.status }); } catch (error) { return mapError(error); } }
+function isAuthorized(request: Request, env: Env): boolean { const authorization = request.headers.get("authorization") ?? ""; const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim(); const apiKey = bearer ?? request.headers.get("x-api-key")?.trim(); const configuredApiKey = env.GATEWAY_API_KEY?.trim(); return Boolean(apiKey && configuredApiKey && apiKey === configuredApiKey); }
+async function fingerprint(value: string): Promise<string> { const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)); return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join(""); }
+async function proxyResponse(response: Response): Promise<Response> { const headers = new Headers(response.headers); for (const [key, value] of Object.entries(corsHeaders())) headers.set(key, value); headers.delete("content-length"); return new Response(response.body, { status: response.status, headers }); }
+function modelsResponse(): Response { const created = Math.floor(Date.now() / 1000); return json({ object: "list", data: [{ id: DEFAULT_CHAT_MODEL, object: "model", created, owned_by: "openai-chatgpt" }, { id: IMAGE_MODEL, object: "model", created, owned_by: "openai-chatgpt" }] }); }
+function mapError(error: unknown): Response { if (error instanceof GatewayRequestError) return errorResponse(error.type, error.message, error.status); if (error instanceof UpstreamError) return errorResponse(error.type, error.message, error.status); if (error instanceof SyntaxError) return errorResponse("invalid_request_error", "Request body must be valid JSON.", 400); const message = error instanceof Error ? error.message : "Unexpected gateway error."; return errorResponse("server_error", message, 500); }
 function json(value: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response { return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...corsHeaders(), ...extraHeaders } }); }
 function errorResponse(type: string, message: string, status: number): Response { return json({ error: { type, message } }, status); }
 function rateLimitResponse(resetAt: number): Response { return withRateLimitHeaders(errorResponse("rate_limit_error", "Rate limit exceeded.", 429), 0, resetAt); }
