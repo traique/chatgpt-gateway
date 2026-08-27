@@ -4,17 +4,23 @@ import { toResponsesInput } from "./validation";
 
 const MAX_UPSTREAM_ATTEMPTS = 3;
 const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
+const CODEX_CLIENT_VERSION = "0.146.0";
+const CODEX_ORIGINATOR = "codex_cli_rs";
+const CODEX_USER_AGENT = `codex_cli_rs/${CODEX_CLIENT_VERSION}`;
 
 export async function createResponsesResponse(env: Env, token: ChatGptToken, request: ResponsesRequest): Promise<Response> {
   const body: Record<string, unknown> = {
     model: normalizeChatModel(request.model),
     input: request.input,
     stream: request.stream,
+    store: false,
+    reasoning: { effort: "medium", summary: "auto" },
+    include: ["reasoning.encrypted_content"],
   };
   if (request.instructions) body.instructions = request.instructions;
   if (request.webSearch) body.tools = [{ type: "web_search" }];
   if (request.maxOutputTokens !== undefined) body.max_output_tokens = request.maxOutputTokens;
-  return fetchCodex(env.CHATGPT_CODEX_ENDPOINT, token, body, request.stream);
+  return fetchCodex(env.CHATGPT_CODEX_ENDPOINT, token, body, request.stream, request.webSearch);
 }
 
 export async function createChatCompletionResponse(env: Env, token: ChatGptToken, request: ChatCompletionRequest): Promise<Response> {
@@ -41,15 +47,15 @@ export async function createImageEditResponse(env: Env, token: ChatGptToken, req
 }
 
 function normalizeChatModel(model: string): string {
-  return model.startsWith("chatgpt-") ? model : `chatgpt-${model}`;
+  return model.startsWith("chatgpt-") ? model.slice("chatgpt-".length) : model;
 }
 
-async function fetchCodex(endpoint: string, token: ChatGptToken, body: Record<string, unknown>, stream: boolean): Promise<Response> {
+async function fetchCodex(endpoint: string, token: ChatGptToken, body: Record<string, unknown>, stream: boolean, webSearch = false): Promise<Response> {
   let lastResponse: Response | null = null;
   for (let attempt = 1; attempt <= MAX_UPSTREAM_ATTEMPTS; attempt += 1) {
     const response = await fetch(endpoint, {
       method: "POST",
-      headers: { Authorization: `Bearer ${token.accessToken}`, "chatgpt-account-id": token.accountId, "content-type": "application/json", Accept: stream ? "text/event-stream" : "application/json" },
+      headers: createCodexHeaders(token, stream, webSearch),
       body: JSON.stringify(body),
     });
     if (response.ok) return response;
@@ -60,6 +66,21 @@ async function fetchCodex(endpoint: string, token: ChatGptToken, body: Record<st
   }
   if (!lastResponse) throw new UpstreamError("No response from upstream.", 502);
   throw new UpstreamError(await readUpstreamError(lastResponse), lastResponse.status);
+}
+
+function createCodexHeaders(token: ChatGptToken, stream: boolean, webSearch: boolean): Record<string, string> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token.accessToken}`,
+    "ChatGPT-Account-Id": token.accountId,
+    "Content-Type": "application/json",
+    Accept: stream ? "text/event-stream" : "application/json",
+    "User-Agent": CODEX_USER_AGENT,
+    originator: CODEX_ORIGINATOR,
+    Version: CODEX_CLIENT_VERSION,
+    session_id: crypto.randomUUID(),
+  };
+  if (webSearch) headers["x-oai-web-search-eligible"] = "true";
+  return headers;
 }
 
 function readRetryAfter(value: string | null): number | undefined {
@@ -144,7 +165,7 @@ function extractOutputText(payload: unknown): string {
 }
 
 function jsonResponse(value: unknown): Response {
-  return new Response(JSON.stringify(value), { headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+  return new Response(JSON.stringify(value), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
