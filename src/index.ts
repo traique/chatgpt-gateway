@@ -79,6 +79,7 @@ async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Re
   if (request.method === "POST" && url.pathname === "/auth/login") return loginAdmin(request, env);
   if (request.method === "POST" && url.pathname === "/auth/logout") return logoutAdmin(request, env);
   if (request.method === "GET" && url.pathname === "/auth/me") return adminMe(request, env);
+  if (request.method === "POST" && url.pathname === "/auth/api-key-check") return apiKeyCheck(request, env);
 
   const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request));
   if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401);
@@ -93,6 +94,35 @@ async function handleAuthRoute(request: Request, env: Env, url: URL): Promise<Re
     return json({ ok: true });
   }
   return errorResponse("invalid_request_error", "Unknown authentication endpoint.", 404);
+}
+
+async function apiKeyCheck(request: Request, env: Env): Promise<Response> {
+  const sessionValid = await isAdminSessionValid(env, readAdminSessionCookie(request));
+  if (!sessionValid) return errorResponse("authentication_error", "Admin login required.", 401);
+
+  try {
+    const payload: unknown = await request.json();
+    if (!isRecord(payload) || typeof payload.api_key !== "string") {
+      return errorResponse("invalid_request_error", "api_key is required.", 400);
+    }
+
+    const receivedKey = payload.api_key.trim();
+    const configuredKey = env.GATEWAY_API_KEY?.trim() ?? "";
+    const [receivedFingerprint, configuredFingerprint] = await Promise.all([
+      fingerprint(receivedKey),
+      fingerprint(configuredKey),
+    ]);
+
+    return json({
+      match: Boolean(receivedKey && configuredKey && receivedKey === configuredKey),
+      received_key_length: receivedKey.length,
+      configured_key_length: configuredKey.length,
+      received_key_sha256: receivedFingerprint,
+      configured_key_sha256: configuredFingerprint,
+    });
+  } catch (error) {
+    return mapError(error);
+  }
 }
 
 async function loginAdmin(request: Request, env: Env): Promise<Response> {
@@ -153,10 +183,15 @@ async function pollDeviceAuth(request: Request, env: Env): Promise<Response> {
 
 function isAuthorized(request: Request, env: Env): boolean {
   const authorization = request.headers.get("authorization") ?? "";
-  const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  const bearer = authorization.match(/^Bearer\\s+(.+)$/i)?.[1]?.trim();
   const apiKey = bearer ?? request.headers.get("x-api-key")?.trim();
   const configuredApiKey = env.GATEWAY_API_KEY?.trim();
   return Boolean(apiKey && configuredApiKey && apiKey === configuredApiKey);
+}
+
+async function fingerprint(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function proxyResponse(response: Response): Promise<Response> {
