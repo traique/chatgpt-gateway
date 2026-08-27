@@ -13,6 +13,8 @@ const DEFAULT_CHAT_MODEL = "chatgpt-gpt-5.6";
 const IMAGE_MODEL = "chatgpt-gpt-image-2";
 const DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device";
 const API_RATE_LIMIT = 60;
+const OPENAI_PROBE_URL = "https://api.openai.com/v1/models";
+const CHATGPT_PROBE_URL = "https://chatgpt.com/robots.txt";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -27,6 +29,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/v1/debug/upstream") return debugUpstreamResponse(env);
     if (request.method === "GET" && url.pathname === "/v1/debug/resolve-override") return debugResolveOverrideResponse(env);
     if (request.method === "GET" && url.pathname === "/v1/debug/transport") return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", checks: await probeWorkerTransports() });
+    if (request.method === "GET" && url.pathname === "/v1/debug/network") return debugNetworkResponse(env);
     if (request.method !== "POST") return errorResponse("invalid_request_error", "Method not allowed.", 405);
     return handleApiRequest(request, env, url);
   },
@@ -34,6 +37,8 @@ export default {
 
 async function debugUpstreamResponse(env: Env): Promise<Response> { try { const token = await getChatGptToken(env); return json(await diagnoseCodexUpstream(env, token)); } catch (error) { return mapError(error); } }
 async function debugResolveOverrideResponse(env: Env): Promise<Response> { try { const endpoint = new URL(env.CHATGPT_CODEX_ENDPOINT); return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", target_host: endpoint.hostname, checks: await probeResolveOverrides(endpoint.hostname) }); } catch (error) { return mapError(error); } }
+async function debugNetworkResponse(env: Env): Promise<Response> { const checks = await Promise.all([probeNetworkEndpoint(CHATGPT_PROBE_URL), probeNetworkEndpoint(OPENAI_PROBE_URL)]); return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", checks }); }
+async function probeNetworkEndpoint(url: string): Promise<Record<string, unknown>> { const response = await fetch(url, { method: "GET", redirect: "manual", cf: { cacheTtl: 0, cacheEverything: false }, headers: { Accept: "application/json, text/plain, */*", "User-Agent": "9Router/3 Codex-Compatible" } }); const body = await response.text(); return { url, status: response.status, ok: response.ok, content_type: response.headers.get("content-type"), cf_ray: response.headers.get("cf-ray"), server: response.headers.get("server"), location: response.headers.get("location"), body_prefix: body.slice(0, 160).replace(/\s+/gu, " ") }; }
 async function healthResponse(env: Env): Promise<Response> { let databaseConfigured = false; try { await env.DB.prepare("SELECT 1").first(); databaseConfigured = true; } catch { databaseConfigured = false; } const diagnostics = { api_key_configured: Boolean(env.GATEWAY_API_KEY?.trim()), admin_credentials_configured: Boolean(env.ADMIN_USERNAME?.trim() && env.ADMIN_PASSWORD?.trim()), encryption_key_configured: Boolean(env.CHATGPT_TOKEN_ENCRYPTION_KEY?.trim()), database_configured: databaseConfigured }; return json({ ok: Object.values(diagnostics).every(Boolean), service: "chatgpt-gateway", diagnostics }, Object.values(diagnostics).every(Boolean) ? 200 : 503); }
 async function handleApiRequest(request: Request, env: Env, url: URL): Promise<Response> { const context = createRequestContext(); const rateLimit = await enforceRateLimit(env, await hashClientKey(request), API_RATE_LIMIT); if (!rateLimit.allowed) return rateLimitResponse(rateLimit.resetAt); try { const payload: unknown = await request.json(); const token = await getChatGptToken(env); const response = await routeApiRequest(url.pathname, env, token, payload); await recordUsage(env, url.pathname, readModel(payload), response.status, Date.now() - context.startedAt, token.accountId); return withRateLimitHeaders(response, rateLimit.remaining, rateLimit.resetAt); } catch (error) { const response = mapError(error); await recordUsage(env, url.pathname, "unknown", response.status, Date.now() - context.startedAt); return withRateLimitHeaders(response, rateLimit.remaining, rateLimit.resetAt); } }
 async function routeApiRequest(pathname: string, env: Env, token: Awaited<ReturnType<typeof getChatGptToken>>, payload: unknown): Promise<Response> { if (pathname === "/v1/chat/completions") return proxyResponse(await createChatCompletionResponse(env, token, validateChatRequest(payload))); if (pathname === "/v1/responses") return proxyResponse(await createResponsesResponse(env, token, validateResponsesRequest(payload))); if (pathname === "/v1/images/generations") return proxyResponse(await createImageResponse(env, token, validateImageGenerationRequest(payload))); if (pathname === "/v1/images/edits") return proxyResponse(await createImageEditResponse(env, token, validateImageEditRequest(payload))); throw new GatewayRequestError("Unknown endpoint."); }
