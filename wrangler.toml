@@ -7,6 +7,7 @@ CHATGPT_AUTH_BASE_URL = "https://auth.openai.com"
 CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CHATGPT_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 CHATGPT_CODEX_IMAGES_ENDPOINT = "https://chatgpt.com/backend-api/codex/images"
+CHATGPT_CODEX_CLIENT_VERSION = "0.148.0"
 
 [[d1_databases]]
 binding = "DB"

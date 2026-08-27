@@ -4,11 +4,12 @@ import { toResponsesInput } from "./validation";
 
 const MAX_UPSTREAM_ATTEMPTS = 3;
 const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
-const CODEX_CLIENT_VERSION = "0.146.0";
+const DEFAULT_CODEX_CLIENT_VERSION = "0.148.0";
 const CODEX_ORIGINATOR = "codex_cli_rs";
-const CODEX_USER_AGENT = `codex_cli_rs/${CODEX_CLIENT_VERSION}`;
+const CODEX_RESPONSES_BETA = "responses=experimental";
 
 export async function createResponsesResponse(env: Env, token: ChatGptToken, request: ResponsesRequest): Promise<Response> {
+  const clientVersion = resolveCodexClientVersion(env);
   const body: Record<string, unknown> = {
     model: normalizeChatModel(request.model),
     input: request.input,
@@ -20,7 +21,7 @@ export async function createResponsesResponse(env: Env, token: ChatGptToken, req
   if (request.instructions) body.instructions = request.instructions;
   if (request.webSearch) body.tools = [{ type: "web_search" }];
   if (request.maxOutputTokens !== undefined) body.max_output_tokens = request.maxOutputTokens;
-  return fetchCodex(env.CHATGPT_CODEX_ENDPOINT, token, body, request.stream, request.webSearch);
+  return fetchCodex(env.CHATGPT_CODEX_ENDPOINT, token, body, request.stream, request.webSearch, clientVersion);
 }
 
 export async function createChatCompletionResponse(env: Env, token: ChatGptToken, request: ChatCompletionRequest): Promise<Response> {
@@ -38,24 +39,36 @@ export async function createChatCompletionResponse(env: Env, token: ChatGptToken
 export async function createImageResponse(env: Env, token: ChatGptToken, request: ImageGenerationRequest): Promise<Response> {
   const body: Record<string, unknown> = { model: "gpt-image-2", prompt: request.prompt, n: request.n ?? 1, size: request.size ?? "auto", quality: request.quality ?? "auto" };
   if (request.background) body.background = request.background;
-  return fetchCodex(`${env.CHATGPT_CODEX_IMAGES_ENDPOINT}/generations`, token, body, false);
+  return fetchCodex(`${env.CHATGPT_CODEX_IMAGES_ENDPOINT}/generations`, token, body, false, false, resolveCodexClientVersion(env));
 }
 
 export async function createImageEditResponse(env: Env, token: ChatGptToken, request: ImageEditRequest): Promise<Response> {
   const body: Record<string, unknown> = { model: "gpt-image-2", prompt: request.prompt, images: Array.isArray(request.image) ? request.image : [request.image], n: 1, size: "auto", quality: "auto" };
-  return fetchCodex(`${env.CHATGPT_CODEX_IMAGES_ENDPOINT}/edits`, token, body, false);
+  return fetchCodex(`${env.CHATGPT_CODEX_IMAGES_ENDPOINT}/edits`, token, body, false, false, resolveCodexClientVersion(env));
 }
 
 function normalizeChatModel(model: string): string {
   return model.startsWith("chatgpt-") ? model.slice("chatgpt-".length) : model;
 }
 
-async function fetchCodex(endpoint: string, token: ChatGptToken, body: Record<string, unknown>, stream: boolean, webSearch = false): Promise<Response> {
+function resolveCodexClientVersion(env: Env): string {
+  const configuredVersion = env.CHATGPT_CODEX_CLIENT_VERSION?.trim();
+  return configuredVersion || DEFAULT_CODEX_CLIENT_VERSION;
+}
+
+async function fetchCodex(
+  endpoint: string,
+  token: ChatGptToken,
+  body: Record<string, unknown>,
+  stream: boolean,
+  webSearch: boolean,
+  clientVersion: string,
+): Promise<Response> {
   let lastResponse: Response | null = null;
   for (let attempt = 1; attempt <= MAX_UPSTREAM_ATTEMPTS; attempt += 1) {
     const response = await fetch(endpoint, {
       method: "POST",
-      headers: createCodexHeaders(token, stream, webSearch),
+      headers: createCodexHeaders(token, stream, webSearch, clientVersion),
       body: JSON.stringify(body),
     });
     if (response.ok) return response;
@@ -68,15 +81,16 @@ async function fetchCodex(endpoint: string, token: ChatGptToken, body: Record<st
   throw new UpstreamError(await readUpstreamError(lastResponse), lastResponse.status);
 }
 
-function createCodexHeaders(token: ChatGptToken, stream: boolean, webSearch: boolean): Record<string, string> {
+function createCodexHeaders(token: ChatGptToken, stream: boolean, webSearch: boolean, clientVersion: string): Record<string, string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token.accessToken}`,
     "ChatGPT-Account-Id": token.accountId,
     "Content-Type": "application/json",
     Accept: stream ? "text/event-stream" : "application/json",
-    "User-Agent": CODEX_USER_AGENT,
+    "User-Agent": `codex_cli_rs/${clientVersion}`,
     originator: CODEX_ORIGINATOR,
-    Version: CODEX_CLIENT_VERSION,
+    Version: clientVersion,
+    "OpenAI-Beta": CODEX_RESPONSES_BETA,
     session_id: crypto.randomUUID(),
   };
   if (webSearch) headers["x-oai-web-search-eligible"] = "true";
@@ -99,6 +113,10 @@ function sleep(milliseconds: number): Promise<void> {
 async function readUpstreamError(response: Response): Promise<string> {
   const body = await response.text();
   if (!body) return `Upstream returned HTTP ${response.status}.`;
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (contentType.includes("text/html") || looksLikeHtml(body)) {
+    return `ChatGPT upstream returned an HTML block page (HTTP ${response.status}).`;
+  }
   try {
     const payload: unknown = JSON.parse(body);
     if (isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === "string") return payload.error.message;
@@ -106,6 +124,10 @@ async function readUpstreamError(response: Response): Promise<string> {
     // Preserve a short diagnostic when the upstream body is not JSON.
   }
   return body.slice(0, 1_000);
+}
+
+function looksLikeHtml(body: string): boolean {
+  return /^\s*<!doctype\s+html[\s>]/iu.test(body) || /^\s*<html[\s>]/iu.test(body);
 }
 
 async function mapResponseToChatCompletion(response: Response, model: string): Promise<Response> {
