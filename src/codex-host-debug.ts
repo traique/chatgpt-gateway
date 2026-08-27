@@ -1,4 +1,5 @@
 export interface CodexHostProbeResult {
+  readonly variant: string;
   readonly host: string;
   readonly path: string;
   readonly status: number;
@@ -18,50 +19,31 @@ const CODEX_ORIGIN = "https://chatgpt.com";
 const CODEX_REFERER = "https://chatgpt.com/";
 const CODEX_ORIGINATOR = "codex_cli_rs";
 const CODEX_VERSION = "0.144.1";
-const CODEX_USER_AGENT = "9Router/3 Codex-Compatible";
+const CODEX_USER_AGENT = "codex_cli_rs/0.144.1";
 
-export async function probeCodexRequestParity(accessToken?: string, accountId?: string): Promise<readonly CodexHostProbeResult[]> {
-  const headers = createParityHeaders(accessToken, accountId);
+export async function probeCodexHosts(): Promise<readonly CodexHostProbeResult[]> {
+  const parityHeaders = createParityHeaders();
   return Promise.all([
-    probe("baseline-models", CODEX_MODELS_PATH, "GET", headers),
-    probe("parity-models", CODEX_MODELS_PATH, "GET", headers),
-    probe("parity-responses", CODEX_RESPONSES_PATH, "POST", headers),
+    probe("baseline-models", CODEX_MODELS_PATH, "GET", new Headers()),
+    probe("parity-models", CODEX_MODELS_PATH, "GET", parityHeaders),
+    probe("parity-responses", CODEX_RESPONSES_PATH, "POST", parityHeaders),
   ]);
 }
 
 async function probe(variant: string, path: string, method: "GET" | "POST", headers: Headers): Promise<CodexHostProbeResult> {
-  const requestHeaders = new Headers(headers);
-  if (variant === "baseline-models") {
-    requestHeaders.delete("originator");
-    requestHeaders.delete("Version");
-    requestHeaders.delete("Origin");
-    requestHeaders.delete("Referer");
-    requestHeaders.delete("User-Agent");
-  }
   const response = await fetch(`https://${CODEX_HOST}${path}`, {
     method,
     redirect: "manual",
-    headers: requestHeaders,
+    headers: new Headers(headers),
     cf: { cacheTtl: 0, cacheEverything: false },
     body: method === "POST" ? JSON.stringify({ model: "gpt-5.4", input: [{ role: "user", content: [{ type: "input_text", text: "ping" }] }], stream: true, store: false }) : undefined,
   });
   const body = await response.text();
-  return {
-    host: CODEX_HOST,
-    path,
-    status: response.status,
-    ok: response.ok,
-    contentType: response.headers.get("content-type"),
-    cfRay: response.headers.get("cf-ray"),
-    server: response.headers.get("server"),
-    location: response.headers.get("location"),
-    allow: response.headers.get("allow"),
-    bodyPrefix: body.slice(0, 300).replace(/\s+/gu, " "),
-  };
+  return { variant, host: CODEX_HOST, path, status: response.status, ok: response.ok, contentType: response.headers.get("content-type"), cfRay: response.headers.get("cf-ray"), server: response.headers.get("server"), location: response.headers.get("location"), allow: response.headers.get("allow"), bodyPrefix: body.slice(0, 300).replace(/\s+/gu, " ") };
 }
 
-function createParityHeaders(accessToken?: string, accountId?: string): Headers {
-  const headers = new Headers({
+function createParityHeaders(): Headers {
+  return new Headers({
     Accept: "application/json, text/event-stream, */*",
     "Content-Type": "application/json",
     "User-Agent": CODEX_USER_AGENT,
@@ -70,7 +52,4 @@ function createParityHeaders(accessToken?: string, accountId?: string): Headers 
     Origin: CODEX_ORIGIN,
     Referer: CODEX_REFERER,
   });
-  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
-  if (accountId) headers.set("ChatGPT-Account-Id", accountId);
-  return headers;
 }
