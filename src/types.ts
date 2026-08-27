@@ -9,6 +9,7 @@ export interface Env {
   CHATGPT_OAUTH_CLIENT_ID: string;
   CHATGPT_TOKEN_ENCRYPTION_KEY: string;
   DB: D1Database;
+  BROWSER_RENDERING?: Fetcher;
 }
 
 export interface ChatGptToken {
