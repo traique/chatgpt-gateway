@@ -4,13 +4,14 @@ import type { ChatGptToken, Env } from "./types";
 
 const TEST_TOKEN: ChatGptToken = { accessToken: "access-token", accountId: "account-id" };
 const TEST_ENV = { CHATGPT_CODEX_ENDPOINT: "https://chatgpt.example.test/backend-api/codex/responses", CHATGPT_CODEX_CLIENT_VERSION: "0.144.1" } as Env;
+const TEST_SSE = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\ndata: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n";
 
 describe("Codex upstream request", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("matches the known-working Render ChatGPT request identity", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ output_text: "OK" }), { status: 200 }));
-    await createResponsesResponse(TEST_ENV, TEST_TOKEN, { model: "chatgpt-gpt-5.4", input: [{ role: "user", content: [{ type: "input_text", text: "Hello" }] }], stream: false, webSearch: false });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(TEST_SSE, { status: 200, headers: { "content-type": "text/event-stream" } }));
+    await createResponsesResponse(TEST_ENV, TEST_TOKEN, { model: "chatgpt-gpt-5.4", input: [{ role: "user", content: [{ type: "input_text", text: "Hello" }] }], stream: true, webSearch: false });
     const [, init] = fetchMock.mock.calls[0];
     const headers = new Headers(init?.headers);
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -29,8 +30,8 @@ describe("Codex upstream request", () => {
   });
 
   it("marks web-search requests as eligible", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ output_text: "OK" }), { status: 200 }));
-    await createResponsesResponse(TEST_ENV, TEST_TOKEN, { model: "gpt-5.4", input: [{ role: "user", content: [{ type: "input_text", text: "Search the web" }] }], stream: false, webSearch: true });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(TEST_SSE, { status: 200, headers: { "content-type": "text/event-stream" } }));
+    await createResponsesResponse(TEST_ENV, TEST_TOKEN, { model: "gpt-5.4", input: [{ role: "user", content: [{ type: "input_text", text: "Search the web" }] }], stream: true, webSearch: true });
     const [, init] = fetchMock.mock.calls[0];
     const headers = new Headers(init?.headers);
     expect(headers.get("x-oai-web-search-eligible")).toBe("true");
@@ -38,6 +39,6 @@ describe("Codex upstream request", () => {
 
   it("returns a bounded diagnostic instead of leaking an HTML block page", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("<html><body>Cloudflare challenge page</body></html>", { status: 403, headers: { "content-type": "text/html; charset=UTF-8" } }));
-    await expect(createResponsesResponse(TEST_ENV, TEST_TOKEN, { model: "gpt-5.4", input: [{ role: "user", content: [{ type: "input_text", text: "Hello" }] }], stream: false, webSearch: false })).rejects.toThrow("ChatGPT upstream returned an HTML block page (HTTP 403)");
+    await expect(createResponsesResponse(TEST_ENV, TEST_TOKEN, { model: "gpt-5.4", input: [{ role: "user", content: [{ type: "input_text", text: "Hello" }] }], stream: true, webSearch: false })).rejects.toThrow("ChatGPT upstream returned an HTML block page (HTTP 403)");
   });
 });
