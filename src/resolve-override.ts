@@ -1,4 +1,4 @@
-const RESOLVE_OVERRIDE_HOSTS = ["chat.openai.com", "chatgpt.com"] as const;
+const RESOLVE_OVERRIDE_HOSTS = ["chat.openai.com", "chatgpt.com", "chatgpt-staging.com"] as const;
 
 export interface ResolveOverrideProbe {
   readonly targetHost: string;
