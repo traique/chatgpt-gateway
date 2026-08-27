@@ -4,6 +4,7 @@ import { GatewayRequestError, UpstreamError } from "./errors";
 import { createChatCompletionResponse, createImageEditResponse, createImageResponse, createResponsesResponse, diagnoseCodexUpstream } from "./providers";
 import { probeResolveOverrides } from "./resolve-override";
 import { probeWorkerTransports } from "./transport-debug";
+import { probeCodexHosts } from "./codex-host-debug";
 import { createRequestContext, enforceRateLimit, getUsageSummary, recordUsage } from "./observability";
 import { validateChatRequest, validateImageEditRequest, validateImageGenerationRequest, validateResponsesRequest } from "./validation";
 import type { Env } from "./types";
@@ -30,6 +31,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/v1/debug/resolve-override") return debugResolveOverrideResponse(env);
     if (request.method === "GET" && url.pathname === "/v1/debug/transport") return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", checks: await probeWorkerTransports() });
     if (request.method === "GET" && url.pathname === "/v1/debug/network") return debugNetworkResponse(env);
+    if (request.method === "GET" && url.pathname === "/v1/debug/codex-hosts") return json({ generated_at: new Date().toISOString(), runtime: "cloudflare-worker", checks: await probeCodexHosts() });
     if (request.method !== "POST") return errorResponse("invalid_request_error", "Method not allowed.", 405);
     return handleApiRequest(request, env, url);
   },
