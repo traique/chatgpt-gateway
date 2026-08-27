@@ -9,13 +9,13 @@ CHATGPT_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 CHATGPT_CODEX_IMAGES_ENDPOINT = "https://chatgpt.com/backend-api/codex/images"
 CHATGPT_CODEX_CLIENT_VERSION = "0.144.1"
 
-[[d1_databases]]
+[d1_databases]
 binding = "DB"
 database_name = "chatgpt-gateway"
 database_id = "b06402d1-adba-4a96-a022-42b26d478a4c"
 migrations_dir = "migrations"
 
-[[browser]]
+[browser]
 binding = "BROWSER_RENDERING"
 
 # Secrets:
