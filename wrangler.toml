@@ -15,6 +15,9 @@ database_name = "chatgpt-gateway"
 database_id = "b06402d1-adba-4a96-a022-42b26d478a4c"
 migrations_dir = "migrations"
 
+[[browser]]
+binding = "BROWSER_RENDERING"
+
 # Secrets:
 # GATEWAY_API_KEY
 # ADMIN_USERNAME
