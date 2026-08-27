@@ -9,6 +9,7 @@ const CODEX_ORIGINATOR = "codex_cli_rs";
 const CODEX_USER_AGENT = "9Router/3 Codex-Compatible";
 const CODEX_ORIGIN = "https://chatgpt.com";
 const CODEX_REFERER = "https://chatgpt.com/";
+const ALTERNATE_UPSTREAM_HOSTS = ["chatgpt.com", "chat.openai.com"];
 
 export async function createResponsesResponse(env: Env, token: ChatGptToken, request: ResponsesRequest): Promise<Response> {
   const clientVersion = resolveCodexClientVersion(env);
@@ -39,23 +40,30 @@ export async function createImageEditResponse(env: Env, token: ChatGptToken, req
 }
 
 export async function diagnoseCodexUpstream(env: Env, token: ChatGptToken): Promise<Record<string, unknown>> {
-  const endpoint = new URL(env.CHATGPT_CODEX_ENDPOINT);
-  const checks = await Promise.all([
-    probeUpstream(`${endpoint.origin}/robots.txt`, token, false),
-    probeUpstream(`${endpoint.origin}/backend-api/codex/models`, token, true),
-    probeUpstream(env.CHATGPT_CODEX_ENDPOINT, token, true),
-  ]);
+  const configuredEndpoint = new URL(env.CHATGPT_CODEX_ENDPOINT);
+  const hosts = Array.from(new Set([configuredEndpoint.hostname, ...ALTERNATE_UPSTREAM_HOSTS]));
+  const checks = await Promise.all(hosts.flatMap((hostname) => [
+    probeUpstream(`https://${hostname}/robots.txt`, token, false),
+    probeUpstream(`https://${hostname}/backend-api/codex/models`, token, true),
+    probeUpstream(`https://${hostname}/backend-api/codex/responses`, token, true),
+    probeRedirect(`https://${hostname}/`, token),
+  ]));
   return { generated_at: new Date().toISOString(), runtime: "cloudflare-worker", checks };
 }
 
 async function probeUpstream(url: string, token: ChatGptToken, authenticated: boolean): Promise<Record<string, unknown>> {
   const headers = authenticated ? createCodexHeaders(token, false, DEFAULT_CODEX_CLIENT_VERSION, true) : { Accept: "text/plain", "User-Agent": CODEX_USER_AGENT };
   const method = url.endsWith("/responses") ? "POST" : "GET";
-  const init: RequestInit = { method, headers };
+  const init: RequestInit = { method, headers, redirect: "manual", cf: { cacheTtl: 0, cacheEverything: false } };
   if (method === "POST") init.body = JSON.stringify({ model: "gpt-5.4", input: [{ role: "user", content: [{ type: "input_text", text: "ping" }] }], stream: true, store: false });
   const response = await fetch(url, init);
   const body = await response.text();
   return { url, method, status: response.status, ok: response.ok, content_type: response.headers.get("content-type"), cf_mitigated: response.headers.get("cf-mitigated"), cf_ray: response.headers.get("cf-ray"), server: response.headers.get("server"), location: response.headers.get("location"), body_prefix: body.slice(0, 160).replace(/\s+/gu, " ") };
+}
+
+async function probeRedirect(url: string, token: ChatGptToken): Promise<Record<string, unknown>> {
+  const response = await fetch(url, { method: "GET", headers: createCodexHeaders(token, false, DEFAULT_CODEX_CLIENT_VERSION, true), redirect: "manual", cf: { cacheTtl: 0, cacheEverything: false } });
+  return { url, method: "GET", status: response.status, location: response.headers.get("location"), content_type: response.headers.get("content-type"), cf_ray: response.headers.get("cf-ray"), server: response.headers.get("server") };
 }
 
 function normalizeChatModel(model: string): string { return model.startsWith("chatgpt-") ? model.slice("chatgpt-".length) : model; }
@@ -64,7 +72,7 @@ function resolveCodexClientVersion(env: Env): string { return env.CHATGPT_CODEX_
 async function fetchCodex(endpoint: string, token: ChatGptToken, body: Record<string, unknown>, webSearch: boolean, clientVersion: string, stream = true): Promise<Response> {
   let lastResponse: Response | null = null;
   for (let attempt = 1; attempt <= MAX_UPSTREAM_ATTEMPTS; attempt += 1) {
-    const response = await fetch(endpoint, { method: "POST", headers: createCodexHeaders(token, webSearch, clientVersion, stream), body: JSON.stringify(body) });
+    const response = await fetch(endpoint, { method: "POST", headers: createCodexHeaders(token, webSearch, clientVersion, stream), body: JSON.stringify(body), redirect: "manual", cf: { cacheTtl: 0, cacheEverything: false } });
     if (response.ok) return response;
     lastResponse = response;
     if (!RETRYABLE_STATUS_CODES.has(response.status) || attempt === MAX_UPSTREAM_ATTEMPTS) break;
@@ -83,15 +91,7 @@ function createCodexHeaders(token: ChatGptToken, webSearch: boolean, clientVersi
 
 function readRetryAfter(value: string | null): number | undefined { if (!value) return undefined; const seconds = Number(value); if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 10_000); const timestamp = Date.parse(value); return Number.isNaN(timestamp) ? undefined : Math.min(Math.max(0, timestamp - Date.now()), 10_000); }
 function sleep(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
-
-async function readUpstreamError(response: Response): Promise<string> {
-  const body = await response.text();
-  if (!body) return `Upstream returned HTTP ${response.status}.`;
-  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-  if (contentType.includes("text/html") || looksLikeHtml(body)) return `ChatGPT upstream returned an HTML block page (HTTP ${response.status}).`;
-  try { const payload: unknown = JSON.parse(body); if (isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === "string") return payload.error.message; } catch { /* Non-JSON upstream response. */ }
-  return body.slice(0, 1_000);
-}
+async function readUpstreamError(response: Response): Promise<string> { const body = await response.text(); if (!body) return `Upstream returned HTTP ${response.status}.`; const contentType = response.headers.get("content-type")?.toLowerCase() ?? ""; if (contentType.includes("text/html") || looksLikeHtml(body)) return `ChatGPT upstream returned an HTML block page (HTTP ${response.status}).`; try { const payload: unknown = JSON.parse(body); if (isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === "string") return payload.error.message; } catch { /* Non-JSON upstream response. */ } return body.slice(0, 1_000); }
 function looksLikeHtml(body: string): boolean { return /^\s*<!doctype\s+html[\s>]/iu.test(body) || /^\s*<html[\s>]/iu.test(body); }
 async function aggregateResponsesStream(response: Response): Promise<Response> { const text = await response.text(); const outputText = extractStreamText(text); if (!outputText) throw new UpstreamError("ChatGPT Responses stream completed without assistant text.", 502); return jsonResponse({ object: "response", output_text: outputText, output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: outputText }] }] }); }
 function extractStreamText(text: string): string { const parts: string[] = []; for (const line of text.split(/\r?\n/u)) { const data = line.trim().startsWith("data:") ? line.trim().slice(5).trim() : ""; if (!data || data === "[DONE]") continue; try { const payload: unknown = JSON.parse(data); if (isRecord(payload) && payload.type === "response.output_text.delta" && typeof payload.delta === "string") parts.push(payload.delta); } catch { /* Ignore malformed SSE frames. */ } } return parts.join(""); }
