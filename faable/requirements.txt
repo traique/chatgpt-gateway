@@ -4,3 +4,4 @@ curl-cffi==0.13.0
 psycopg[binary]==3.2.9
 cryptography==45.0.6
 python-multipart==0.0.20
+itsdangerous==2.2.0
