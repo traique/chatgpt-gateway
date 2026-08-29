@@ -1,5 +1,6 @@
 # ChatGPT Gateway
 
+
 Cloudflare Worker gateway cho ChatGPT/Codex upstream, cung cấp API tương thích OpenAI và giao diện quản trị mobile-first.
 
 > **Lưu ý:** ChatGPT/Codex authentication và backend endpoint được thiết kế cho Codex và có thể thay đổi. Gateway không phải OpenAI Public API.
