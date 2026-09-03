@@ -59,7 +59,7 @@ def test_chat_completions_payload_preserves_system_and_message_structure() -> No
 
 
 def test_chat_completions_payload_preserves_image_url() -> None:
-    payload = {"model": "gpt-5.6", "messages": [{"role": "user", "content": [{"type": "text", "text": "What is this?"}, {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}}]}]}
+    payload = {"model": "gpt-5.6", "messages": [{"role": "user", "content": [{"type": "text", "text": "What is this?"}, {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}}]}
     upstream = runtime.build_chat_completions_payload(payload)
     assert upstream["input"][0]["content"] == [{"type": "input_text", "text": "What is this?"}, {"type": "input_image", "image_url": "https://example.com/a.jpg"}]
 
@@ -82,3 +82,17 @@ def test_non_stream_chat_response_aggregates_responses_sse() -> None:
     assert result["model"] == "chatgpt-gpt-5.6"
     assert result["choices"][0]["message"]["content"] == "Hello world"
     response.iter_lines.assert_called_once()
+
+
+def test_normalize_gateway_api_key_strips_configuration_and_header_whitespace() -> None:
+    assert runtime.normalize_gateway_api_key("  gateway-secret\n") == "gateway-secret"
+
+
+def test_authorize_accepts_api_key_with_transport_whitespace() -> None:
+    original_key = runtime.GATEWAY_API_KEY
+    runtime.GATEWAY_API_KEY = "gateway-secret"
+    try:
+        runtime.authorize("Bearer gateway-secret\n", None)
+        runtime.authorize(None, " gateway-secret ")
+    finally:
+        runtime.GATEWAY_API_KEY = original_key
