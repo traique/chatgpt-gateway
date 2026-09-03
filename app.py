@@ -1,156 +1,139 @@
-from __future__ import annotations
-
-import base64
+import os
 import json
-import time
-import uuid
+import logging
+import requests
+from flask import Flask, request, Response, jsonify
 
-from curl_cffi import requests
-from fastapi import Request
-from fastapi.responses import JSONResponse, RedirectResponse
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("chatgpt-gateway")
 
-from faable.app import app
-from faable import app as gateway
+app = Flask(__name__)
 
+CHATGPT_BACKEND_URL = os.environ.get("CHATGPT_BACKEND_URL", "https://chatgpt.com/backend-api").rstrip("/")
+DEFAULT_ACCESS_TOKEN = os.environ.get("CHATGPT_ACCESS_TOKEN", "")
+GATEWAY_SECRET = os.environ.get("GATEWAY_SECRET", "")
 
-@app.get("/", include_in_schema=False)
-def root() -> RedirectResponse:
-    return RedirectResponse(url="/auth", status_code=307)
+@app.after_request
+def set_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, x-requested-with, Cookie"
+    return response
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "status": "online",
+        "service": "ChatGPT Session Gateway",
+        "platform": "Faable Deploy"
+    }), 200
 
-def extract_account_id(token: str) -> str | None:
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+def get_token(req):
+    auth_header = req.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        bearer_token = auth_header[7:].strip()
+        if GATEWAY_SECRET and bearer_token == GATEWAY_SECRET:
+            return DEFAULT_ACCESS_TOKEN
+        return bearer_token
+    return DEFAULT_ACCESS_TOKEN
+
+@app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
+def chat_completions():
+    if request.method == "OPTIONS":
+        return Response(status=204)
+
+    token = get_token(request)
+    if not token:
+        return jsonify({
+            "error": "Missing access token. Set CHATGPT_ACCESS_TOKEN env or send Bearer token."
+        }), 401
+
+    payload = request.get_json(silent=True) or {}
+    messages = payload.get("messages", [])
+    model = payload.get("model", "text-davinci-002-render-sha")
+    is_stream = payload.get("stream", True)
+
+    chatgpt_payload = {
+        "action": "next",
+        "messages": [
+            {
+                "id": "aaa11111-1111-1111-1111-111111111111",
+                "author": {"role": msg.get("role", "user")},
+                "content": {"content_type": "text", "parts": [msg.get("content", "")]}
+            }
+            for msg in messages
+        ],
+        "model": model,
+        "parent_message_id": "aaa22222-2222-2222-2222-222222222222"
+    }
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/event-stream" if is_stream else "application/json"
+    }
+
+    target_url = f"{CHATGPT_BACKEND_URL}/conversation"
+
     try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return None
-        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
-    except Exception:
-        return None
-
-    direct = payload.get("chatgpt_account_id") or payload.get("account_id")
-    if isinstance(direct, str) and direct:
-        return direct
-
-    auth = payload.get("https://api.openai.com/auth")
-    if isinstance(auth, dict):
-        account_id = auth.get("chatgpt_account_id") or auth.get("account_id")
-        if isinstance(account_id, str) and account_id:
-            return account_id
-        organizations = auth.get("organizations")
-        if isinstance(organizations, list) and organizations:
-            first = organizations[0]
-            if isinstance(first, dict) and isinstance(first.get("id"), str) and first["id"]:
-                return first["id"]
-
-    organizations = payload.get("organizations")
-    if isinstance(organizations, list) and organizations:
-        first = organizations[0]
-        if isinstance(first, dict) and isinstance(first.get("id"), str) and first["id"]:
-            return first["id"]
-
-    return None
-
-
-async def device_poll_override(request: Request) -> JSONResponse:
-    gateway.require_admin(request)
-    gateway.database_required()
-    payload = await request.json()
-    login_id = payload.get("login_id")
-    if not isinstance(login_id, str):
-        return JSONResponse({"detail": "login_id is required."}, status_code=400)
-
-    with gateway.db() as connection:
-        row = connection.execute(
-            "SELECT id, device_auth_id, user_code, expires_at, status FROM device_login_sessions WHERE id=%s",
-            (login_id,),
-        ).fetchone()
-
-    if not row:
-        return JSONResponse({"detail": "Login session not found."}, status_code=404)
-    if row[4] != "pending":
-        return JSONResponse({"login_id": login_id, "status": str(row[4])})
-    if int(row[3]) <= int(time.time() * 1000):
-        with gateway.db() as connection:
-            connection.execute(
-                "UPDATE device_login_sessions SET status='expired', updated_at=%s WHERE id=%s",
-                (int(time.time() * 1000), login_id),
-            )
-        return JSONResponse({"login_id": login_id, "status": "expired"})
-
-    response = requests.post(
-        f"{gateway.CHATGPT_AUTH_BASE_URL}/api/accounts/deviceauth/token",
-        headers=gateway.device_auth_headers(),
-        json={"device_auth_id": row[1], "user_code": row[2]},
-        impersonate="chrome120",
-        timeout=30,
-    )
-    if response.status_code in (403, 404):
-        return JSONResponse({"login_id": login_id, "status": "pending"})
-    if not response.ok:
-        with gateway.db() as connection:
-            connection.execute(
-                "UPDATE device_login_sessions SET status='failed', updated_at=%s WHERE id=%s",
-                (int(time.time() * 1000), login_id),
-            )
-        return JSONResponse({"detail": f"Device login failed: {gateway.read_error(response)}"}, status_code=502)
-
-    auth_payload = response.json()
-    authorization_code = auth_payload.get("authorization_code")
-    code_verifier = auth_payload.get("code_verifier")
-    if not isinstance(authorization_code, str) or not isinstance(code_verifier, str):
-        return JSONResponse({"detail": "Device login returned an invalid authorization payload."}, status_code=502)
-
-    token_response = requests.post(
-        f"{gateway.CHATGPT_AUTH_BASE_URL}/oauth/token",
-        data={
-            "grant_type": "authorization_code",
-            "code": authorization_code,
-            "redirect_uri": "https://auth.openai.com/deviceauth/callback",
-            "client_id": gateway.CHATGPT_OAUTH_CLIENT_ID,
-            "code_verifier": code_verifier,
-        },
-        headers={"content-type": "application/x-www-form-urlencoded", "user-agent": gateway.CODEX_USER_AGENT},
-        impersonate="chrome120",
-        timeout=30,
-    )
-    if not token_response.ok:
-        return JSONResponse({"detail": f"OAuth token exchange failed: {gateway.read_error(token_response)}"}, status_code=502)
-
-    tokens = token_response.json()
-    access_token = tokens.get("access_token")
-    refresh_token = tokens.get("refresh_token")
-    id_token = tokens.get("id_token")
-    account_id = extract_account_id(id_token or "") or extract_account_id(access_token or "")
-    if not isinstance(access_token, str) or not isinstance(refresh_token, str) or not account_id:
-        return JSONResponse({"detail": "OAuth response is missing ChatGPT account ID or required credentials."}, status_code=502)
-
-    now = int(time.time() * 1000)
-    label = str(payload.get("label") or f"ChatGPT {time.strftime('%Y-%m-%d %H:%M')}")[:100]
-    with gateway.db() as connection:
-        connection.execute(
-            "INSERT INTO chatgpt_accounts (id,label,account_id,access_token_enc,refresh_token_enc,id_token_enc,expires_at,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)",
-            (
-                str(uuid.uuid4()), label, account_id,
-                gateway.encrypt_token(access_token), gateway.encrypt_token(refresh_token),
-                gateway.encrypt_token(id_token) if isinstance(id_token, str) else None,
-                now + int(tokens.get("expires_in", 3600)) * 1000, now, now,
-            ),
+        req_proxy = requests.post(
+            target_url,
+            headers=headers,
+            json=chatgpt_payload,
+            stream=is_stream,
+            timeout=120
         )
-        connection.execute(
-            "UPDATE device_login_sessions SET status='completed', updated_at=%s WHERE id=%s",
-            (now, login_id),
+
+        if is_stream:
+            def generate_stream():
+                for chunk in req_proxy.iter_lines():
+                    if chunk:
+                        yield chunk.decode("utf-8") + "\n\n"
+            return Response(generate_stream(), content_type="text/event-stream")
+
+        return Response(req_proxy.content, status=req_proxy.status_code, content_type="application/json")
+
+    except Exception as e:
+        logger.error(f"Error calling ChatGPT Backend: {e}")
+        return jsonify({"error": f"Gateway proxy failed: {str(e)}"}), 502
+
+@app.route("/backend-api/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+def proxy_backend_api(path):
+    if request.method == "OPTIONS":
+        return Response(status=204)
+
+    token = get_token(request)
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length"]}
+    
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    target_url = f"{CHATGPT_BACKEND_URL}/{path}"
+
+    try:
+        resp = requests.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            params=request.args,
+            data=request.get_data(),
+            stream=True,
+            timeout=120
         )
-    return JSONResponse({"login_id": login_id, "status": "completed"})
+        return Response(resp.iter_content(chunk_size=4096), status=resp.status_code, content_type=resp.headers.get("content-type"))
+    except Exception as e:
+        logger.error(f"Error forwarding: {e}")
+        return jsonify({"error": str(e)}), 502
 
-
-@app.middleware("http")
-async def auth_device_poll_compat(request: Request, call_next):
-    if request.method == "POST" and request.url.path == "/auth/device/poll":
-        try:
-            return await device_poll_override(request)
-        except Exception as error:
-            return JSONResponse({"detail": f"Device login processing failed: {error}"}, status_code=502)
-    return await call_next(request)
-
-
-__all__ = ["app"]
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
