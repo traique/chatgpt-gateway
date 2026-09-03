@@ -95,29 +95,27 @@ Backend dùng PostgreSQL trực tiếp; Supabase Auth không được dùng đ�
 
 ## Deploy Faable Free
 
-Faable Free sử dụng **managed Python buildpack**. Không sử dụng Docker/container deployment trên Free.
+Repo được bố trí để Faable Free tự nhận **managed Python buildpack** từ root repository. Không cần `rootDir`, `faable.json` hoặc Docker.
 
 ### Install command
 
 ```bash
-pip install -r faable/requirements.txt
+pip install -r requirements.txt
 ```
 
 ### Start command
 
 ```bash
-uvicorn faable.app:app --host 0.0.0.0 --port $PORT
+uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
 
 ### Procfile
 
-Repo đã có `Procfile` tương thích:
-
 ```text
-web: uvicorn faable.app:app --host 0.0.0.0 --port $PORT
+web: uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
 
-> Dockerfile/container deployment yêu cầu **Hobby hoặc Pro** theo giới hạn plan của Faable. Bản Free nên deploy bằng managed Python buildpack.
+> Docker/container deployment yêu cầu **Hobby hoặc Pro** theo giới hạn plan của Faable. Bản Free dùng managed Python buildpack.
 
 ## Health check
 
@@ -248,7 +246,7 @@ Access token và refresh token không được lưu plaintext trong Supabase.
 Cài dependency:
 
 ```bash
-pip install -r faable/requirements-dev.txt
+pip install -r requirements.txt
 ```
 
 Chạy test:
