@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import time
@@ -188,20 +189,34 @@ def read_error(response: Any) -> str:
 
 
 def extract_account_id(token: str) -> str | None:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
     try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return None
         decoded = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
         payload = json.loads(decoded)
-        direct = payload.get("chatgpt_account_id")
-        if isinstance(direct, str):
-            return direct
-        auth = payload.get("https://api.openai.com/auth", {})
-        if isinstance(auth, dict) and isinstance(auth.get("chatgpt_account_id"), str):
-            return auth["chatgpt_account_id"]
-    except Exception:
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return None
+    if not isinstance(payload, dict):
+        return None
+    direct = payload.get("chatgpt_account_id")
+    if isinstance(direct, str) and direct:
+        return direct
+    account_id = payload.get("account_id")
+    if isinstance(account_id, str) and account_id:
+        return account_id
+    auth = payload.get("https://api.openai.com/auth")
+    if isinstance(auth, dict):
+        nested = auth.get("chatgpt_account_id")
+        if isinstance(nested, str) and nested:
+            return nested
+    organizations = payload.get("organizations")
+    if isinstance(organizations, list):
+        for organization in organizations:
+            if isinstance(organization, dict):
+                organization_id = organization.get("id")
+                if isinstance(organization_id, str) and organization_id:
+                    return organization_id
     return None
 
 
