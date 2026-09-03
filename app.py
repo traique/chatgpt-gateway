@@ -221,4 +221,9 @@ runtime.parse_device_auth_payload = parse_device_auth_payload
 _remove_original_device_poll_route()
 app.add_api_route("/auth/device/poll", device_poll, methods=["POST"])
 
+# Keep the documented root entrypoint and the Faable entrypoint on the same handler.
+from faable.device_auth_patch import install as install_device_auth_patch
+
+install_device_auth_patch(runtime)
+
 __all__ = ["app", "classify_device_auth_response", "device_poll", "parse_device_auth_payload"]
