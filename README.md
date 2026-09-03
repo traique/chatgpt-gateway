@@ -72,7 +72,7 @@ Schema chuẩn nằm tại:
 supabase/schema.sql
 ```
 
-Chạy file này trong **Supabase SQL Editor** trước khi sử dụng device login.
+Chạy **toàn bộ nội dung `supabase/schema.sql` trong Supabase SQL Editor** trước khi sử dụng device login.
 
 Các bảng chính:
 
@@ -93,7 +93,15 @@ ORDER BY table_name;
 
 Backend dùng PostgreSQL trực tiếp; Supabase Auth không được dùng để lưu session admin của gateway.
 
-## Deploy Faable
+## Deploy Faable Free
+
+Faable Free sử dụng **managed Python buildpack**. Không sử dụng Docker/container deployment trên Free.
+
+### Install command
+
+```bash
+pip install -r faable/requirements.txt
+```
 
 ### Start command
 
@@ -101,26 +109,15 @@ Backend dùng PostgreSQL trực tiếp; Supabase Auth không được dùng đ�
 uvicorn faable.app:app --host 0.0.0.0 --port $PORT
 ```
 
-### Docker
-
-Dockerfile đã được cấu hình để chạy:
-
-```text
-faable/requirements.txt
-faable/app.py
-```
-
-Container command:
-
-```bash
-uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}
-```
-
 ### Procfile
+
+Repo đã có `Procfile` tương thích:
 
 ```text
 web: uvicorn faable.app:app --host 0.0.0.0 --port $PORT
 ```
+
+> Dockerfile/container deployment yêu cầu **Hobby hoặc Pro** theo giới hạn plan của Faable. Bản Free nên deploy bằng managed Python buildpack.
 
 ## Health check
 
