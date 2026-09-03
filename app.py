@@ -72,7 +72,9 @@ def classify_device_auth_response(response: Any) -> tuple[str, str | None]:
         description = payload.get("error_description") or payload.get("message")
 
     normalized_code = str(code).strip().lower() if code is not None else ""
-    if normalized_code in PENDING_DEVICE_AUTH_CODES or response.status_code in (403, 404):
+    if normalized_code in PENDING_DEVICE_AUTH_CODES:
+        return "pending", None
+    if response.status_code == 404 and not code and not description:
         return "pending", None
 
     if code or description:
