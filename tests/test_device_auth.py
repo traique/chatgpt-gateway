@@ -3,6 +3,7 @@ from unittest.mock import Mock
 import pytest
 
 from app import classify_device_auth_response, parse_device_auth_payload
+from faable import app as runtime
 
 
 def make_response(status_code: int, headers: dict[str, str], payload: object = None, text: str = "") -> Mock:
@@ -60,3 +61,15 @@ def test_classify_device_auth_response_rejects_explicit_authorization_error() ->
 
     assert status == "failed"
     assert message == "Device authorization denied."
+
+
+def test_faable_runtime_uses_patched_device_poll_route() -> None:
+    routes = [
+        route
+        for route in runtime.app.routes
+        if getattr(route, "path", None) == "/auth/device/poll"
+        and "POST" in getattr(route, "methods", set())
+    ]
+
+    assert len(routes) == 1
+    assert routes[0].endpoint.__module__ == "faable.device_auth_patch"
