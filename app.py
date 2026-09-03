@@ -9,6 +9,12 @@ from fastapi import HTTPException, Request
 
 app = runtime.app
 
+PENDING_DEVICE_AUTH_CODES = frozenset({
+    "deviceauth_authorization_pending",
+    "authorization_pending",
+    "pending",
+})
+
 
 def parse_device_auth_payload(response: Any) -> dict[str, Any]:
     try:
@@ -45,6 +51,43 @@ def _remove_original_device_poll_route() -> None:
     ]
 
 
+def classify_device_auth_response(response: Any) -> tuple[str, str | None]:
+    content_type = response.headers.get("content-type", "").lower()
+    if response.headers.get("cf-mitigated", "").lower() == "challenge":
+        return "failed", "OpenAI authentication endpoint returned a Cloudflare challenge."
+    if "text/html" in content_type:
+        return "failed", f"OpenAI authentication endpoint returned HTML (HTTP {response.status_code})."
+
+    try:
+        payload = parse_device_auth_payload(response)
+    except ValueError:
+        return "failed", f"OpenAI authentication endpoint returned an invalid response (HTTP {response.status_code})."
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = error.get("code") or error.get("type") or error.get("error")
+        description = error.get("message") or error.get("error_description")
+    else:
+        code = error or payload.get("error_code") or payload.get("code")
+        description = payload.get("error_description") or payload.get("message")
+
+    normalized_code = str(code).strip().lower() if code is not None else ""
+    if normalized_code in PENDING_DEVICE_AUTH_CODES or response.status_code in (403, 404):
+        return "pending", None
+
+    if code or description:
+        return "failed", str(description or code)
+    return "failed", f"OpenAI authentication endpoint returned HTTP {response.status_code}."
+
+
+def _mark_device_session(login_id: str, status: str) -> None:
+    with runtime.db() as connection:
+        connection.execute(
+            "UPDATE device_login_sessions SET status=%s, updated_at=%s WHERE id=%s",
+            (status, int(time.time() * 1000), login_id),
+        )
+
+
 def device_poll(request: Request, payload: dict[str, Any]) -> dict[str, str]:
     runtime.require_admin(request)
     runtime.database_required()
@@ -67,11 +110,7 @@ def device_poll(request: Request, payload: dict[str, Any]) -> dict[str, str]:
 
     now = int(time.time() * 1000)
     if int(row[3]) <= now:
-        with runtime.db() as connection:
-            connection.execute(
-                "UPDATE device_login_sessions SET status='expired', updated_at=%s WHERE id=%s",
-                (now, login_id),
-            )
+        _mark_device_session(login_id, "expired")
         return {"login_id": login_id, "status": "expired"}
 
     response = runtime.requests.post(
@@ -83,13 +122,14 @@ def device_poll(request: Request, payload: dict[str, Any]) -> dict[str, str]:
     )
 
     if response.status_code in (403, 404):
-        return {"login_id": login_id, "status": "pending"}
+        state, message = classify_device_auth_response(response)
+        if state == "pending":
+            return {"login_id": login_id, "status": "pending"}
+        _mark_device_session(login_id, "failed")
+        raise HTTPException(status_code=502, detail=message or "Device login authorization failed.")
+
     if not response.ok:
-        with runtime.db() as connection:
-            connection.execute(
-                "UPDATE device_login_sessions SET status='failed', updated_at=%s WHERE id=%s",
-                (int(time.time() * 1000), login_id),
-            )
+        _mark_device_session(login_id, "failed")
         raise HTTPException(
             status_code=502,
             detail=f"Device login failed: {runtime.read_error(response)}",
@@ -125,6 +165,7 @@ def device_poll(request: Request, payload: dict[str, Any]) -> dict[str, str]:
         timeout=30,
     )
     if not token_response.ok:
+        _mark_device_session(login_id, "failed")
         raise HTTPException(
             status_code=502,
             detail=f"OAuth token exchange failed: {runtime.read_error(token_response)}",
@@ -178,4 +219,4 @@ runtime.parse_device_auth_payload = parse_device_auth_payload
 _remove_original_device_poll_route()
 app.add_api_route("/auth/device/poll", device_poll, methods=["POST"])
 
-__all__ = ["app", "device_poll", "parse_device_auth_payload"]
+__all__ = ["app", "classify_device_auth_response", "device_poll", "parse_device_auth_payload"]
