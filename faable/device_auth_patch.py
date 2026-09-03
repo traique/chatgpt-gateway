@@ -5,7 +5,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Header, Request
 from fastapi.responses import StreamingResponse
 
 PENDING_DEVICE_AUTH_CODES = frozenset({
@@ -340,13 +340,13 @@ def install(runtime: Any) -> None:
             )
         return {"login_id": login_id, "status": "completed"}
 
-    def responses(payload: dict[str, Any], authorization: str | None = None, x_api_key: str | None = None) -> Any:
+    def responses(payload: dict[str, Any], authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> Any:
         runtime.authorize(authorization, x_api_key)
         upstream_payload = {**payload, "store": False, "stream": True}
         response = runtime.upstream_request(upstream_payload)
         return upstream_response(runtime, response)
 
-    def chat_completions(payload: dict[str, Any], authorization: str | None = None, x_api_key: str | None = None) -> Any:
+    def chat_completions(payload: dict[str, Any], authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> Any:
         runtime.authorize(authorization, x_api_key)
         upstream_payload = build_chat_completions_payload(payload)
         response = runtime.upstream_request(upstream_payload)
