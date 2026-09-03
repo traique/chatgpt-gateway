@@ -8,7 +8,7 @@ os.environ["ADMIN_USERNAME"] = "admin"
 os.environ["ADMIN_PASSWORD"] = "password"
 os.environ["CHATGPT_TOKEN_ENCRYPTION_KEY"] = "Z1hVQ2FhRk5lY0JjR2xYc2t3V3R4dVh6a0F5cE1tRkE="
 
-from faable.app import app
+from faable.app import app, extract_account_id
 
 client = TestClient(app)
 
@@ -49,3 +49,27 @@ def test_admin_login_rejects_invalid_credentials() -> None:
         json={"username": "admin", "password": "wrong"},
     )
     assert response.status_code == 401
+
+
+def test_extract_account_id_from_chatgpt_claim() -> None:
+    token = "eyJhbGciOiJub25lIn0.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50LWRpcmVjdCJ9.signature"
+    assert extract_account_id(token) == "account-direct"
+
+
+def test_extract_account_id_from_openai_auth_claim() -> None:
+    token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC1hdXRoIn19.signature"
+    assert extract_account_id(token) == "account-auth"
+
+
+def test_extract_account_id_from_account_id_claim() -> None:
+    token = "eyJhbGciOiJub25lIn0.eyJhY2NvdW50X2lkIjoiYWNjb3VudC1mYWxsYmFjayJ9.signature"
+    assert extract_account_id(token) == "account-fallback"
+
+
+def test_extract_account_id_from_organization_claim() -> None:
+    token = "eyJhbGciOiJub25lIn0.eyJvcmdhbml6YXRpb25zIjpbeyJpZCI6ImFjY291bnQtb3JnIn1dfQ.signature"
+    assert extract_account_id(token) == "account-org"
+
+
+def test_extract_account_id_rejects_invalid_token() -> None:
+    assert extract_account_id("not-a-jwt") is None
