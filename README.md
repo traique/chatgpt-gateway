@@ -1,20 +1,8 @@
 # ChatGPT Gateway
 
-FastAPI gateway chạy trên Faable, kết nối ChatGPT/Codex upstream và lưu account/session data trên Supabase PostgreSQL.
+FastAPI gateway chạy trên **Faable**, kết nối ChatGPT/Codex upstream bằng `curl-cffi` và lưu account/session data trên **Supabase PostgreSQL**.
 
-> ChatGPT/Codex authentication và backend endpoint được thiết kế cho Codex và có thể thay đổi. Gateway không phải OpenAI Public API.
-
-## Chức năng
-
-- Chat / Responses API / SSE streaming
-- Web Search
-- GPT Image generation / editing
-- Admin login bằng username + password
-- HttpOnly session cookie
-- ChatGPT device login
-- Credential ChatGPT mã hóa phía server
-- Supabase PostgreSQL cho account/session data
-- Rate limit
+> ChatGPT/Codex authentication và backend endpoint là private/internal interfaces và có thể thay đổi. Gateway không phải OpenAI Public API.
 
 ## Kiến trúc
 
@@ -23,66 +11,126 @@ Client
   ↓
 Faable / FastAPI
   ├── /auth
+  ├── /v1/models
+  ├── /v1/debug/transport
   ├── /v1/chat/completions
-  ├── /v1/responses
-  ├── /v1/images/generations
-  └── /v1/images/edits
+  └── /v1/responses
           ↓
-     ChatGPT/Codex
-          
-Faable / FastAPI
+     ChatGPT/Codex upstream
           ↓
-Supabase PostgreSQL
+     Supabase PostgreSQL
 ```
+
+Không còn Cloudflare Workers, D1, Wrangler hoặc SQLite/Turso runtime.
+
+## Runtime
+
+- Python 3.11+
+- FastAPI + Uvicorn
+- `curl-cffi` với browser impersonation
+- PostgreSQL qua `psycopg`
+- Supabase PostgreSQL làm persistent storage
+- Fernet để mã hóa access/refresh token trước khi lưu DB
+- HttpOnly admin session cookie
 
 ## Environment variables
 
+Bắt buộc cho gateway API:
+
 ```text
 GATEWAY_API_KEY
-ADMIN_USERNAME
-ADMIN_PASSWORD
+```
+
+Bắt buộc cho Supabase/device login:
+
+```text
+DATABASE_URL
 SESSION_SECRET
 CHATGPT_TOKEN_ENCRYPTION_KEY
-DATABASE_URL
+ADMIN_USERNAME
+ADMIN_PASSWORD
+```
+
+Các biến upstream có default:
+
+```text
 CHATGPT_AUTH_BASE_URL
 CHATGPT_CODEX_ENDPOINT
 CHATGPT_OAUTH_CLIENT_ID
 CHATGPT_CODEX_CLIENT_VERSION
 ```
 
-`DATABASE_URL` dùng connection string PostgreSQL của Supabase.
+`DATABASE_URL` là PostgreSQL connection string của Supabase. Với production nên dùng connection string/pooler phù hợp với giới hạn connection của project.
 
 `CHATGPT_TOKEN_ENCRYPTION_KEY` phải là Fernet key hợp lệ. Không commit secrets vào GitHub.
 
-## Deploy Faable
+## Supabase setup
 
-Faable chạy ứng dụng FastAPI bằng Uvicorn:
-
-```bash
-uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}
-```
-
-Docker image hiện tại sử dụng `faable/app.py` làm application entrypoint.
-
-## Supabase
-
-Gateway tự kiểm tra kết nối database khi khởi động và tạo các bảng cần thiết nếu chưa tồn tại:
+Schema chuẩn nằm tại:
 
 ```text
-chatgpt_accounts
-device_login_sessions
+supabase/schema.sql
 ```
 
-Có thể kiểm tra bằng:
+Chạy file này trong **Supabase SQL Editor** trước khi sử dụng device login.
+
+Các bảng chính:
+
+```text
+public.chatgpt_accounts
+public.device_login_sessions
+```
+
+Kiểm tra:
 
 ```sql
 SELECT table_name
 FROM information_schema.tables
 WHERE table_schema = 'public'
+  AND table_name IN ('chatgpt_accounts', 'device_login_sessions')
 ORDER BY table_name;
 ```
 
-## Admin login
+Backend dùng PostgreSQL trực tiếp; Supabase Auth không được dùng để lưu session admin của gateway.
+
+## Deploy Faable
+
+### Start command
+
+```bash
+uvicorn faable.app:app --host 0.0.0.0 --port $PORT
+```
+
+### Docker
+
+Dockerfile đã được cấu hình để chạy:
+
+```text
+faable/requirements.txt
+faable/app.py
+```
+
+Container command:
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}
+```
+
+### Procfile
+
+```text
+web: uvicorn faable.app:app --host 0.0.0.0 --port $PORT
+```
+
+## Health check
+
+```text
+GET /health
+```
+
+Endpoint này trả trạng thái cấu hình runtime, transport và database configuration.
+
+## Admin
 
 Mở:
 
@@ -97,7 +145,7 @@ ADMIN_USERNAME
 ADMIN_PASSWORD
 ```
 
-Session được lưu bằng HttpOnly cookie và có TTL 12 giờ.
+Session admin có TTL 12 giờ và sử dụng HttpOnly cookie.
 
 ## ChatGPT device login
 
@@ -114,22 +162,46 @@ Nhập user code
   ↓
 OAuth token exchange
   ↓
-Credential mã hóa trong Supabase
+Credential mã hóa bằng Fernet
+  ↓
+Supabase PostgreSQL
 ```
 
-Gateway không yêu cầu email/password ChatGPT.
+Gateway không yêu cầu lưu email/password ChatGPT.
 
 ## API authentication
+
+Sử dụng một trong hai dạng:
 
 ```http
 Authorization: Bearer YOUR_GATEWAY_API_KEY
 ```
 
-## Chat
+hoặc:
+
+```http
+X-API-Key: YOUR_GATEWAY_API_KEY
+```
+
+## Models
+
+```text
+GET /v1/models
+```
+
+Model hiện được expose:
+
+```text
+chatgpt-gpt-5.6
+```
+
+## Chat Completions
 
 ```text
 POST /v1/chat/completions
 ```
+
+Ví dụ:
 
 ```json
 {
@@ -141,36 +213,7 @@ POST /v1/chat/completions
 }
 ```
 
-## Web Search
-
-```json
-{
-  "model": "chatgpt-gpt-5.6",
-  "messages": [
-    {"role": "user", "content": "Tìm tin tức mới nhất về AI."}
-  ],
-  "web_search": true
-}
-```
-
-## Image
-
-```text
-POST /v1/images/generations
-```
-
-```json
-{
-  "model": "chatgpt-gpt-image-2",
-  "prompt": "A cinematic photorealistic portrait in Saigon at golden hour"
-}
-```
-
-## Image Edit
-
-```text
-POST /v1/images/edits
-```
+Gateway chuyển request sang ChatGPT/Codex Responses endpoint và trả SSE stream.
 
 ## Responses API
 
@@ -178,14 +221,56 @@ POST /v1/images/edits
 POST /v1/responses
 ```
 
-## Models
+Gateway ép `store=false` và streaming để phù hợp với gateway runtime hiện tại.
+
+## Transport debug
 
 ```text
-GET /v1/models
+GET /v1/debug/transport
 ```
 
-## Usage
+Endpoint này kiểm tra khả năng kết nối HTTPS từ Faable tới `chatgpt.com` bằng `curl-cffi`.
+
+Nó chỉ kiểm tra transport/network; HTTP 200 từ `robots.txt` không có nghĩa ChatGPT backend API đã xác thực thành công.
+
+## Account management
+
+Các endpoint admin:
 
 ```text
-GET /v1/usage
+POST   /auth/device/start
+POST   /auth/device/poll
+GET    /auth/accounts
+DELETE /auth/accounts/{account_id}
 ```
+
+Access token và refresh token không được lưu plaintext trong Supabase.
+
+## Development
+
+Cài dependency:
+
+```bash
+pip install -r faable/requirements-dev.txt
+```
+
+Chạy test:
+
+```bash
+PYTHONPATH=. pytest -q
+```
+
+CI hiện chạy cùng command và phải pass trước khi deploy.
+
+## Scope hiện tại
+
+Runtime hiện tại tập trung vào:
+
+1. Faable/FastAPI runtime.
+2. curl-cffi transport tới ChatGPT/Codex.
+3. Device Login + OAuth token storage.
+4. Supabase PostgreSQL persistence.
+5. `/v1/chat/completions` và `/v1/responses` streaming.
+6. Admin/account management.
+
+Image API, Web Search API riêng và Usage/Rate-limit API chưa được expose trong runtime hiện tại; không nên coi các endpoint đó là supported cho tới khi được implement và có regression tests.
