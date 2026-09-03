@@ -269,3 +269,5 @@ Runtime hiện tại tập trung vào:
 6. Admin/account management.
 
 Image API, Web Search API riêng và Usage/Rate-limit API chưa được expose trong runtime hiện tại; không nên coi các endpoint đó là supported cho tới khi được implement và có regression tests.
+
+
