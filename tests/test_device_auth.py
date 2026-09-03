@@ -2,7 +2,16 @@ from unittest.mock import Mock
 
 import pytest
 
-from faable.app import parse_device_auth_payload
+from app import classify_device_auth_response, parse_device_auth_payload
+
+
+def make_response(status_code: int, headers: dict[str, str], payload: object = None, text: str = "") -> Mock:
+    response = Mock()
+    response.status_code = status_code
+    response.headers = headers
+    response.text = text
+    response.json.return_value = payload
+    return response
 
 
 def test_parse_device_auth_payload_rejects_non_json_response() -> None:
@@ -14,3 +23,40 @@ def test_parse_device_auth_payload_rejects_non_json_response() -> None:
 
     with pytest.raises(ValueError, match="non-JSON.*HTTP 200"):
         parse_device_auth_payload(response)
+
+
+def test_classify_device_auth_response_accepts_pending_error() -> None:
+    response = make_response(
+        403,
+        {"content-type": "application/json"},
+        {"error": {"code": "deviceauth_authorization_pending"}},
+    )
+
+    assert classify_device_auth_response(response) == ("pending", None)
+
+
+def test_classify_device_auth_response_rejects_cloudflare_challenge() -> None:
+    response = make_response(
+        403,
+        {"content-type": "text/html", "cf-mitigated": "challenge"},
+        text="<html>challenge</html>",
+    )
+
+    status, message = classify_device_auth_response(response)
+
+    assert status == "failed"
+    assert message is not None
+    assert "Cloudflare challenge" in message
+
+
+def test_classify_device_auth_response_rejects_explicit_authorization_error() -> None:
+    response = make_response(
+        403,
+        {"content-type": "application/json"},
+        {"error": {"code": "access_denied", "message": "Device authorization denied."}},
+    )
+
+    status, message = classify_device_auth_response(response)
+
+    assert status == "failed"
+    assert message == "Device authorization denied."
