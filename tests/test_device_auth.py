@@ -82,3 +82,16 @@ def test_non_stream_chat_response_aggregates_responses_sse() -> None:
     assert result["model"] == "chatgpt-gpt-5.6"
     assert result["choices"][0]["message"]["content"] == "Hello world"
     response.iter_lines.assert_called_once()
+
+
+def test_normalize_gateway_api_key_strips_configuration_and_header_whitespace() -> None:
+    assert runtime.normalize_gateway_api_key("  gateway-secret\n") == "gateway-secret"
+
+
+def test_authorize_accepts_normalized_bearer_token() -> None:
+    original_key = runtime.GATEWAY_API_KEY
+    runtime.GATEWAY_API_KEY = "gateway-secret"
+    try:
+        runtime.authorize("  bEaReR   gateway-secret  ", None)
+    finally:
+        runtime.GATEWAY_API_KEY = original_key

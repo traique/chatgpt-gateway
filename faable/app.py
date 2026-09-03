@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hmac
 import json
 import os
 import time
@@ -18,7 +19,7 @@ from starlette.middleware.sessions import SessionMiddleware
 CHATGPT_AUTH_BASE_URL = os.getenv("CHATGPT_AUTH_BASE_URL", "https://auth.openai.com")
 CHATGPT_ENDPOINT = os.getenv("CHATGPT_CODEX_ENDPOINT", "https://chatgpt.com/backend-api/codex/responses")
 CHATGPT_OAUTH_CLIENT_ID = os.getenv("CHATGPT_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
-GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
+GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "").strip()
 CHATGPT_ACCESS_TOKEN = os.getenv("CHATGPT_ACCESS_TOKEN", "")
 CHATGPT_ACCOUNT_ID = os.getenv("CHATGPT_ACCOUNT_ID", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -36,6 +37,10 @@ DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
 app = FastAPI(title="chatgpt-gateway", version="0.4.0", docs_url=None, redoc_url=None)
 if SESSION_SECRET:
     app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, max_age=43200, same_site="lax", https_only=True)
+
+
+def normalize_gateway_api_key(value: str) -> str:
+    return value.strip()
 
 
 def database_required() -> None:
@@ -94,8 +99,13 @@ def require_admin(request: Request) -> None:
 
 
 def authorize(authorization: str | None, x_api_key: str | None) -> None:
-    supplied = x_api_key or (authorization.removeprefix("Bearer ").strip() if authorization else "")
-    if not GATEWAY_API_KEY or supplied != GATEWAY_API_KEY:
+    supplied = normalize_gateway_api_key(x_api_key) if x_api_key else ""
+    if not supplied and authorization:
+        normalized_authorization = authorization.strip()
+        scheme, separator, token = normalized_authorization.partition(" ")
+        supplied = normalize_gateway_api_key(token) if separator and scheme.lower() == "bearer" else normalized_authorization
+
+    if not GATEWAY_API_KEY or not hmac.compare_digest(supplied, GATEWAY_API_KEY):
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
