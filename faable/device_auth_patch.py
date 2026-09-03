@@ -13,6 +13,7 @@ PENDING_DEVICE_AUTH_CODES = frozenset({
     "authorization_pending",
     "pending",
 })
+DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
 
 
 def parse_json_payload(response: Any) -> dict[str, Any]:
@@ -111,6 +112,13 @@ def _extract_message_blocks(message: dict[str, Any], role: str) -> list[dict[str
     return blocks
 
 
+def normalize_codex_model(value: str) -> str:
+    model = value.removeprefix("chatgpt-")
+    if model == "gpt-5.6":
+        return DEFAULT_CODEX_MODEL
+    return model
+
+
 def build_chat_completions_payload(payload: dict[str, Any]) -> dict[str, Any]:
     messages = payload.get("messages")
     if not isinstance(messages, list):
@@ -136,7 +144,7 @@ def build_chat_completions_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not input_items:
         input_items = [{"role": "user", "content": [{"type": "input_text", "text": ""}]}]
 
-    model = str(payload.get("model") or "gpt-5.4").removeprefix("chatgpt-")
+    model = normalize_codex_model(str(payload.get("model") or DEFAULT_CODEX_MODEL))
     instructions = "\n\n".join(system_chunks) or "You are a helpful assistant."
     return {
         "model": model,
@@ -356,6 +364,7 @@ def install(runtime: Any) -> None:
 
     runtime.parse_device_auth_payload = parse_json_payload
     runtime.classify_device_auth_response = classify_device_auth_response
+    runtime.normalize_codex_model = normalize_codex_model
     runtime.build_chat_completions_payload = build_chat_completions_payload
     runtime.aggregate_chat_completion = aggregate_chat_completion
     runtime.upstream_response = lambda response: upstream_response(runtime, response)
