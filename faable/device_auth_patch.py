@@ -14,6 +14,7 @@ PENDING_DEVICE_AUTH_CODES = frozenset({
     "pending",
 })
 DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
+PUBLIC_MODEL_CATALOG = ("chatgpt-gpt-5.6",)
 
 
 def parse_json_payload(response: Any) -> dict[str, Any]:
@@ -233,7 +234,7 @@ def upstream_response(runtime: Any, response: Any, requested_model: str | None =
 
 
 def install(runtime: Any) -> None:
-    _remove_routes(runtime, frozenset({"/auth/device/poll", "/v1/chat/completions", "/v1/responses"}))
+    _remove_routes(runtime, frozenset({"/auth/device/poll", "/v1/chat/completions", "/v1/responses", "/v1/models"}))
 
     def device_poll(request: Request, payload: dict[str, Any]) -> dict[str, str]:
         runtime.require_admin(request)
@@ -351,6 +352,9 @@ def install(runtime: Any) -> None:
     def responses(payload: dict[str, Any], authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> Any:
         runtime.authorize(authorization, x_api_key)
         upstream_payload = {**payload, "store": False, "stream": True}
+        requested_model = upstream_payload.get("model")
+        if isinstance(requested_model, str):
+            upstream_payload = {**upstream_payload, "model": normalize_codex_model(requested_model)}
         response = runtime.upstream_request(upstream_payload)
         return upstream_response(runtime, response)
 
@@ -360,7 +364,18 @@ def install(runtime: Any) -> None:
         response = runtime.upstream_request(upstream_payload)
         if bool(payload.get("stream", False)):
             return upstream_response(runtime, response)
-        return aggregate_chat_completion(response, str(payload.get("model") or "gpt-5.4"), str(upstream_payload["model"]))
+        return aggregate_chat_completion(response, str(payload.get("model") or DEFAULT_CODEX_MODEL), str(upstream_payload["model"]))
+
+    def models(authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+        runtime.authorize(authorization, x_api_key)
+        created = int(time.time())
+        return {
+            "object": "list",
+            "data": [
+                {"id": model_id, "object": "model", "created": created, "owned_by": "openai-chatgpt"}
+                for model_id in PUBLIC_MODEL_CATALOG
+            ],
+        }
 
     runtime.parse_device_auth_payload = parse_json_payload
     runtime.classify_device_auth_response = classify_device_auth_response
@@ -371,3 +386,4 @@ def install(runtime: Any) -> None:
     runtime.app.add_api_route("/auth/device/poll", device_poll, methods=["POST"])
     runtime.app.add_api_route("/v1/responses", responses, methods=["POST"])
     runtime.app.add_api_route("/v1/chat/completions", chat_completions, methods=["POST"])
+    runtime.app.add_api_route("/v1/models", models, methods=["GET"])
