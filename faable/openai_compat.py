@@ -10,8 +10,10 @@ from fastapi import Header, HTTPException
 from fastapi.responses import StreamingResponse
 
 DEFAULT_PUBLIC_MODEL = "chatgpt-gpt-5.6"
+DEFAULT_IMAGE_MODEL = "gpt-image-2"
 IMAGE_TOOL_TYPE = "image_generation"
 WEB_SEARCH_TOOL_TYPES = frozenset({"web_search", "web_search_preview"})
+IMAGE_ENDPOINT_SUFFIX = "/images/generations"
 
 
 def _convert_tool(tool: dict[str, Any]) -> dict[str, Any] | None:
@@ -58,7 +60,11 @@ def _convert_tools(payload: dict[str, Any]) -> list[dict[str, Any]]:
         tool.get("type") == "web_search" for tool in converted
     ):
         options = payload.get("web_search_options")
-        converted.append({"type": "web_search", **options} if isinstance(options, dict) else {"type": "web_search"})
+        converted.append(
+            {"type": "web_search", **options}
+            if isinstance(options, dict)
+            else {"type": "web_search"}
+        )
 
     return converted
 
@@ -164,11 +170,8 @@ def iter_openai_chat_stream(response: Any, requested_model: str) -> Iterator[str
                 call_id = str(event.get("item_id") or event.get("call_id") or "0")
                 delta = str(event.get("delta") or "")
                 function_arguments[call_id] = function_arguments.get(call_id, "") + delta
-                if first_delta:
-                    first_delta = False
-                    role_delta: dict[str, Any] = {"role": "assistant"}
-                else:
-                    role_delta = {}
+                role_delta = {"role": "assistant"} if first_delta else {}
+                first_delta = False
                 yield _sse({
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -303,7 +306,9 @@ def _aggregate_with_tools(response: Any, requested_model: str, provider_model: s
                     for part in content:
                         if not isinstance(part, dict):
                             continue
-                        annotations.extend(part.get("annotations", [])) if isinstance(part.get("annotations"), list) else None
+                        part_annotations = part.get("annotations")
+                        if isinstance(part_annotations, list):
+                            annotations.extend(part_annotations)
                         text = part.get("text")
                         if isinstance(text, str) and text and not text_parts:
                             text_parts.append(text)
@@ -328,34 +333,129 @@ def _aggregate_with_tools(response: Any, requested_model: str, provider_model: s
     }
 
 
-def _image_generation_response(response: Any) -> dict[str, Any]:
+def _responses_input(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    value = payload.get("input")
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": value}],
+        }]
+    raise HTTPException(status_code=400, detail="input must be a string or array.")
+
+
+def _aggregate_responses(response: Any, requested_model: str, provider_model: str) -> dict[str, Any]:
     events = _read_response_events(response)
-    images: list[str] = []
+    completed: dict[str, Any] | None = None
+    output: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    annotations: list[dict[str, Any]] = []
     terminal_error: str | None = None
 
     for event in events:
         event_type = event.get("type")
-        if event_type in {"response.error", "response.failed"}:
+        if event_type == "response.completed" and isinstance(event.get("response"), dict):
+            completed = event["response"]
+        elif event_type in {"response.error", "response.failed"}:
             terminal_error = str(event.get("error") or event.get("response") or event)[:500]
-            break
-        if event_type != "response.output_item.done":
-            continue
-        item = _output_item(event)
-        if not item or item.get("type") != "image_generation_call":
-            continue
-        result = item.get("result")
-        if isinstance(result, str) and result:
-            images.append(result)
+        elif event_type == "response.output_item.done":
+            item = _output_item(event)
+            if isinstance(item, dict):
+                output.append(item)
+                if item.get("type") == "message":
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        for part in content:
+                            if not isinstance(part, dict):
+                                continue
+                            text = part.get("text")
+                            if isinstance(text, str):
+                                text_parts.append(text)
+                            part_annotations = part.get("annotations")
+                            if isinstance(part_annotations, list):
+                                annotations.extend(part_annotations)
 
     if terminal_error:
-        raise HTTPException(status_code=502, detail=f"ChatGPT image generation failed: {terminal_error}")
-    if not images:
-        raise HTTPException(status_code=502, detail="ChatGPT image generation completed without image data.")
+        raise HTTPException(status_code=502, detail=f"ChatGPT Responses stream failed: {terminal_error}")
+    if completed is not None:
+        return completed
 
+    response_id = f"resp_{uuid.uuid4().hex}"
+    message_content: list[dict[str, Any]] = []
+    text = "".join(text_parts)
+    if text:
+        part: dict[str, Any] = {"type": "output_text", "text": text}
+        if annotations:
+            part["annotations"] = annotations
+        message_content.append(part)
+    if not output and text:
+        output = [{"id": f"msg_{uuid.uuid4().hex}", "type": "message", "role": "assistant", "content": message_content}]
     return {
-        "created": int(time.time()),
-        "data": [{"b64_json": image} for image in images],
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": requested_model,
+        "output": output,
+        "output_text": text,
+        "provider_model": provider_model,
     }
+
+
+def _native_image_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    from faable import app as runtime
+
+    requested_model = str(payload.get("model") or DEFAULT_IMAGE_MODEL)
+    model = DEFAULT_IMAGE_MODEL if requested_model.startswith("chatgpt-") or requested_model.startswith("gpt-5.") else requested_model
+    result: dict[str, Any] = {"model": model}
+    for key in ("prompt", "n", "size", "quality", "background", "output_format", "output_compression", "moderation"):
+        value = payload.get(key)
+        if value is not None:
+            result[key] = value
+    return result
+
+
+def _native_image_endpoint(runtime: Any) -> str:
+    endpoint = runtime.CHATGPT_ENDPOINT.rstrip("/")
+    if endpoint.endswith("/responses"):
+        return endpoint[: -len("/responses")] + IMAGE_ENDPOINT_SUFFIX
+    return endpoint + IMAGE_ENDPOINT_SUFFIX
+
+
+def _image_generation_native(runtime: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt is required.")
+
+    access_token, account_id = runtime.get_active_token()
+    headers = runtime.upstream_headers(access_token, account_id)
+    headers["Accept"] = "application/json"
+    request_payload = _native_image_payload(payload)
+    request_payload["prompt"] = prompt
+
+    response = runtime.requests.post(
+        _native_image_endpoint(runtime),
+        headers=headers,
+        json=request_payload,
+        impersonate="chrome120",
+        timeout=300,
+    )
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+            detail = body.get("error") if isinstance(body, dict) else body
+        except (TypeError, ValueError):
+            detail = response.text[:1000]
+        raise HTTPException(status_code=response.status_code, detail=str(detail or "Image generation failed."))
+
+    try:
+        result = response.json()
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=502, detail="ChatGPT image endpoint returned invalid JSON.") from error
+    if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+        raise HTTPException(status_code=502, detail="ChatGPT image endpoint returned an invalid image response.")
+    return result
 
 
 def _remove_route(runtime: Any, path: str) -> None:
@@ -367,6 +467,7 @@ def _remove_route(runtime: Any, path: str) -> None:
 def install(runtime: Any) -> None:
     _remove_route(runtime, "/v1/chat/completions")
     _remove_route(runtime, "/v1/images/generations")
+    _remove_route(runtime, "/v1/responses")
 
     def chat_completions(
         payload: dict[str, Any],
@@ -385,11 +486,27 @@ def install(runtime: Any) -> None:
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        return _aggregate_with_tools(
-            response,
-            requested_model,
-            str(upstream_payload["model"]),
-        )
+        return _aggregate_with_tools(response, requested_model, str(upstream_payload["model"]))
+
+    def responses(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+    ) -> Any:
+        runtime.authorize(authorization, x_api_key)
+        requested_model = str(payload.get("model") or DEFAULT_PUBLIC_MODEL)
+        upstream_payload = {**payload, "input": _responses_input(payload), "store": False}
+        upstream_payload["model"] = runtime.normalize_codex_model(requested_model)
+        upstream_payload["stream"] = True
+
+        response = runtime.upstream_request(upstream_payload)
+        if bool(payload.get("stream", False)):
+            return StreamingResponse(
+                response.iter_content(chunk_size=4096),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+        return _aggregate_responses(response, requested_model, str(upstream_payload["model"]))
 
     def images_generations(
         payload: dict[str, Any],
@@ -397,24 +514,8 @@ def install(runtime: Any) -> None:
         x_api_key: str | None = Header(default=None),
     ) -> dict[str, Any]:
         runtime.authorize(authorization, x_api_key)
-        prompt = payload.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise HTTPException(status_code=400, detail="prompt is required.")
-
-        model = str(payload.get("model") or DEFAULT_PUBLIC_MODEL)
-        upstream_payload: dict[str, Any] = {
-            "model": runtime.normalize_codex_model(model),
-            "input": prompt,
-            "tools": [{"type": IMAGE_TOOL_TYPE, "action": "generate"}],
-            "store": False,
-            "stream": True,
-        }
-        for key in ("quality", "size", "background", "output_format", "output_compression"):
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                upstream_payload["tools"][0][key] = value
-        response = runtime.upstream_request(upstream_payload)
-        return _image_generation_response(response)
+        return _image_generation_native(runtime, payload)
 
     runtime.app.add_api_route("/v1/chat/completions", chat_completions, methods=["POST"])
+    runtime.app.add_api_route("/v1/responses", responses, methods=["POST"])
     runtime.app.add_api_route("/v1/images/generations", images_generations, methods=["POST"])
