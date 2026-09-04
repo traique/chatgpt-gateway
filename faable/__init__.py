@@ -1,6 +1,4 @@
 from . import app as runtime
-from .device_auth_patch import install
+from . import openai_compat
 
-install(runtime)
-
-__all__ = ["runtime"]
+openai_compat.install(runtime)
