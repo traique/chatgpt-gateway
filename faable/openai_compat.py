@@ -6,17 +6,19 @@ import uuid
 from collections.abc import Iterator
 from typing import Any
 
-from fastapi import Header, HTTPException
+from fastapi import Header
 from fastapi.responses import StreamingResponse
 
 
 def build_openai_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    upstream = build_chat_completions_payload(payload)
+    from faable import app as runtime
 
-    for source_key, target_key in (("temperature", "temperature"), ("top_p", "top_p")):
+    upstream = runtime.build_chat_completions_payload(payload)
+
+    for source_key in ("temperature", "top_p"):
         value = payload.get(source_key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            upstream[target_key] = value
+            upstream[source_key] = value
 
     max_tokens = payload.get("max_tokens")
     if not isinstance(max_tokens, int):
@@ -128,6 +130,3 @@ def install(runtime: Any) -> None:
         )
 
     runtime.app.add_api_route("/v1/chat/completions", chat_completions, methods=["POST"])
-
-
-build_chat_completions_payload = lambda payload: payload
