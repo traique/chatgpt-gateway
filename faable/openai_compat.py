@@ -17,6 +17,7 @@ IMAGE_ENDPOINT_SUFFIX = "/images/generations"
 IMAGE_DEFAULT_QUALITY = "auto"
 IMAGE_DEFAULT_SIZE = "auto"
 IMAGE_DEFAULT_BACKGROUND = "auto"
+IMAGE_DIAGNOSTIC_HEADERS = ("www-authenticate", "x-request-id", "cf-ray", "server", "content-type")
 
 
 def _convert_tool(tool: dict[str, Any]) -> dict[str, Any] | None:
@@ -266,6 +267,10 @@ def _aggregate_responses(response: Any, requested_model: str, provider_model: st
     if terminal_error:
         raise HTTPException(status_code=502, detail=f"ChatGPT Responses stream failed: {terminal_error}")
     if completed is not None:
+        if not completed.get("output") and output:
+            completed = {**completed, "output": output}
+        if text_parts and not completed.get("output_text"):
+            completed = {**completed, "output_text": "".join(text_parts)}
         return completed
     text = "".join(text_parts)
     message_content: list[dict[str, Any]] = []
@@ -300,16 +305,22 @@ def _native_image_endpoint(runtime: Any) -> str:
 
 
 def _image_upstream_headers(runtime: Any, access_token: str, account_id: str) -> dict[str, str]:
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "ChatGPT-Account-Id": account_id,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": runtime.CODEX_USER_AGENT,
-        "originator": runtime.CODEX_ORIGINATOR,
-        "Version": runtime.CODEX_VERSION,
-    }
-    return headers
+    return {"Authorization": f"Bearer {access_token}", "ChatGPT-Account-Id": account_id, "Content-Type": "application/json", "Accept": "application/json", "User-Agent": runtime.CODEX_USER_AGENT, "originator": runtime.CODEX_ORIGINATOR, "Version": runtime.CODEX_VERSION}
+
+
+def _safe_upstream_error(response: Any) -> str:
+    body_text = response.text[:1000].strip()
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            body_text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))[:1000]
+        elif body is not None:
+            body_text = str(body)[:1000]
+    except (TypeError, ValueError):
+        pass
+    headers = {name: str(response.headers.get(name)) for name in IMAGE_DIAGNOSTIC_HEADERS if response.headers.get(name)}
+    diagnostic = {"status": response.status_code, "headers": headers, "body": body_text}
+    return f"Image generation upstream rejected request: {json.dumps(diagnostic, ensure_ascii=False, separators=(',', ':'))}"
 
 
 def _image_generation_native(runtime: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -319,12 +330,7 @@ def _image_generation_native(runtime: Any, payload: dict[str, Any]) -> dict[str,
     access_token, account_id = runtime.get_active_token()
     response = runtime.requests.post(_native_image_endpoint(runtime), headers=_image_upstream_headers(runtime, access_token, account_id), json=_native_image_payload(payload), impersonate="chrome120", timeout=300)
     if response.status_code >= 400:
-        try:
-            body = response.json()
-            detail = body.get("error") if isinstance(body, dict) else body
-        except (TypeError, ValueError):
-            detail = response.text[:1000]
-        raise HTTPException(status_code=response.status_code, detail=str(detail or f"Image generation upstream HTTP {response.status_code}."))
+        raise HTTPException(status_code=response.status_code, detail=_safe_upstream_error(response))
     try:
         result = response.json()
     except (TypeError, ValueError) as error:
