@@ -1,3 +1,4 @@
+import app  # noqa: F401
 from unittest.mock import Mock
 
 from faable import app as runtime
