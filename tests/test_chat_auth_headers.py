@@ -17,7 +17,10 @@ def test_chat_completions_reads_authorization_from_header(monkeypatch) -> None:
         response = Mock()
         response.status_code = 200
         response.headers = {"content-type": "text/event-stream"}
-        response.iter_content.return_value = [b"data: {}\n\n"]
+        response.iter_lines.return_value = [
+            b'data: {"type":"response.output_text.delta","delta":"ping"}',
+            b"data: [DONE]",
+        ]
         return response
 
     monkeypatch.setattr(runtime, "upstream_request", fake_upstream_request)
@@ -41,7 +44,10 @@ def test_chat_completions_reads_x_api_key_from_header(monkeypatch) -> None:
         response = Mock()
         response.status_code = 200
         response.headers = {"content-type": "text/event-stream"}
-        response.iter_content.return_value = [b"data: {}\n\n"]
+        response.iter_lines.return_value = [
+            b'data: {"type":"response.output_text.delta","delta":"ping"}',
+            b"data: [DONE]",
+        ]
         return response
 
     monkeypatch.setattr(runtime, "upstream_request", fake_upstream_request)

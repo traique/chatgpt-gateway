@@ -48,7 +48,7 @@ def test_openai_chat_stream_emits_openai_compatible_chunks() -> None:
     assert '"role":"assistant"' in payloads[0]
     assert '"content":"Xin"' in payloads[0]
     assert '"content":" chao"' in payloads[1]
-    assert payloads[-1].strip() == "data: [DONE]\n\n"
+    assert payloads[-1] == "data: [DONE]\n\n"
     response.close.assert_called_once()
 
 
@@ -63,7 +63,7 @@ def test_openai_chat_stream_falls_back_to_completed_output_item() -> None:
     payloads = [event.decode() if isinstance(event, bytes) else event for event in events]
 
     assert '"content":"OK"' in payloads[0]
-    assert payloads[-1].strip() == "data: [DONE]\n\n"
+    assert payloads[-1] == "data: [DONE]\n\n"
     response.close.assert_called_once()
 
 
@@ -77,5 +77,5 @@ def test_openai_chat_stream_closes_response_after_upstream_error() -> None:
     payloads = [event.decode() if isinstance(event, bytes) else event for event in events]
 
     assert "upstream failed" in payloads[0]
-    assert payloads[-1].strip() == "data: [DONE]\n\n"
+    assert payloads[-1] == "data: [DONE]\n\n"
     response.close.assert_called_once()

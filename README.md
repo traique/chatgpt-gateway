@@ -14,8 +14,9 @@ Faable / FastAPI
   ├── /auth
   ├── /v1/models
   ├── /v1/debug/transport
-  ├── /v1/chat/completions
-  └── /v1/responses
+  ├── /v1/chat/completions  (OpenAI-compatible, hỗ trợ tool calling)
+  ├── /v1/responses         (OpenAI Responses, passthrough stream)
+  └── /v1/messages          (Anthropic Messages-compatible)
           ↓
      ChatGPT/Codex upstream
           ↓
@@ -52,6 +53,13 @@ ADMIN_USERNAME
 ADMIN_PASSWORD
 ```
 
+Tùy chọn cho provider B.AI (bật provider thứ hai trong trang admin):
+
+```text
+BAI_API_KEY     # API key của B.AI (https://api.b.ai)
+BAI_BASE_URL    # mặc định https://api.b.ai/v1
+```
+
 Các biến upstream có default:
 
 ```text
@@ -80,6 +88,7 @@ Các bảng chính:
 ```text
 public.chatgpt_accounts
 public.device_login_sessions
+public.gateway_settings
 ```
 
 Kiểm tra:
@@ -218,6 +227,27 @@ POST /v1/responses
 
 Gateway ép `store=false` và streaming để phù hợp với gateway runtime hiện tại.
 
+## Anthropic Messages API
+
+```text
+POST /v1/messages
+```
+
+Endpoint tương thích Anthropic Messages API (cho Claude Code và các tool nói chuẩn Anthropic):
+system/messages/tool_use/tool_result được dịch sang Responses upstream; streaming trả
+`message_start` / `content_block_start` / `content_block_delta` / `message_delta` / `message_stop`;
+lỗi trả về dạng `{"type": "error", "error": {"type", "message"}}`.
+
+## Tool calling
+
+`/v1/chat/completions` hỗ trợ đầy đủ agent loop:
+- `tools` trong request được convert sang Responses tools.
+- Upstream `function_call` được trả về client dưới dạng `delta.tool_calls` (stream) hoặc
+  `message.tool_calls` (non-stream) với `finish_reason: "tool_calls"`.
+- Lịch sử `assistant.tool_calls` và `role: "tool"` được convert thành
+  `function_call` / `function_call_output` items.
+- `usage` (prompt/completion/total tokens) được trả về từ upstream khi có.
+
 ## Transport debug
 
 ```text
@@ -227,6 +257,44 @@ GET /v1/debug/transport
 Endpoint này kiểm tra khả năng kết nối HTTPS từ Faable tới `chatgpt.com` bằng `curl-cffi`.
 
 Nó chỉ kiểm tra transport/network; HTTP 200 từ `robots.txt` không có nghĩa ChatGPT backend API đã xác thực thành công.
+
+## Providers
+
+Gateway hỗ trợ nhiều provider upstream, chọn trong trang admin (`/auth`) tại thẻ **Provider & Model**:
+
+| Provider | Endpoint | Xác thực | Ghi chú |
+| --- | --- | --- | --- |
+| `chatgpt` | ChatGPT/Codex backend (mặc định) | Device login | Đầy đủ tool calling, usage |
+| `bai` | `https://api.b.ai/v1` (OpenAI/Anthropic/Responses compatible) | `BAI_API_KEY` | Passthrough native cả 3 protocol |
+
+API admin:
+
+```text
+GET  /auth/providers           # liệt kê provider, model và trạng thái đang chọn
+POST /auth/providers/select    # {"provider": "chatgpt"|"bai", "model": "..."}
+```
+
+Lựa chọn được lưu trong bảng `gateway_settings` (hoặc trong bộ nhớ nếu không có `DATABASE_URL`). Khi client gọi model mặc định (`chatgpt-gpt-5.6` hoặc bỏ trống), gateway dùng model admin đã chọn cho provider đang active; model client ghi rõ thì được truyền nguyên. `/v1/models` trả về danh sách model của provider đang active (B.AI được query trực tiếp từ `GET /v1/models` của B.AI với cache 60 giây).
+
+### Client keys — mỗi client một provider riêng
+
+Thẻ **Client Keys** trên trang admin cho phép tạo API key riêng cho từng client (bot, CLI, app…), mỗi key gắn với một provider + model cụ thể:
+
+| Client key | Provider | Model | Ưu tiên |
+| --- | --- | --- | --- |
+| Key master (`GATEWAY_API_KEY`) | Provider chọn chung (thẻ Provider & Model) | Model chung | Mặc định |
+| Client key | Provider gán cho key đó | Model gán cho key đó | Ghi đè lựa chọn chung |
+
+API admin (yêu cầu đăng nhập admin):
+
+```text
+GET    /auth/clients                 # danh sách client keys (key đã mask)
+POST   /auth/clients                 # {"label", "provider", "model", "key?"} — bỏ trống key để tự sinh (gwc-…)
+POST   /auth/clients/{id}            # {"provider"?, "model"?, "label"?, "status"?}
+DELETE /auth/clients/{id}            # xóa vĩnh viễn
+```
+
+Client keys được mã hóa Fernet trong bảng `gateway_api_keys` (kèm SHA-256 hash để tra cứu); key đầy đủ chỉ hiển thị một lần lúc tạo. Client key không model (để trống) sẽ dùng model chung của gateway.
 
 ## Account management
 
@@ -266,7 +334,7 @@ Runtime hiện tại tập trung vào:
 2. curl-cffi transport tới ChatGPT/Codex.
 3. Device Login + OAuth token storage.
 4. Supabase PostgreSQL persistence.
-5. `/v1/chat/completions` và `/v1/responses` streaming.
+5. `/v1/chat/completions` (có tool calling), `/v1/responses` và `/v1/messages` streaming.
 6. Admin/account management.
 
 Image API, Web Search API riêng và Usage/Rate-limit API chưa được expose trong runtime hiện tại; không nên coi các endpoint đó là supported cho tới khi được implement và có regression tests.

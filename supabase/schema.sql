@@ -35,5 +35,30 @@ create index if not exists device_login_sessions_status_idx
 create index if not exists device_login_sessions_expires_at_idx
     on public.device_login_sessions (expires_at);
 
+create table if not exists public.gateway_settings (
+    key text primary key,
+    value text not null,
+    updated_at bigint not null
+);
+
+alter table public.gateway_settings enable row level security;
+
+create table if not exists public.gateway_api_keys (
+    id text primary key,
+    label text not null,
+    key_enc text not null,
+    key_hash text not null unique,
+    provider text not null,
+    model text not null default '',
+    status text not null default 'active',
+    created_at bigint not null,
+    updated_at bigint not null
+);
+
+create index if not exists gateway_api_keys_hash_idx
+    on public.gateway_api_keys (key_hash);
+
+alter table public.gateway_api_keys enable row level security;
+
 alter table public.chatgpt_accounts enable row level security;
 alter table public.device_login_sessions enable row level security;
