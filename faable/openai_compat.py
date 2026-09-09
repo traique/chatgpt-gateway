@@ -9,6 +9,8 @@ from typing import Any
 from fastapi import Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .notion_provider import aggregate_notion_chat, iter_notion_chat_stream
+
 DEFAULT_PUBLIC_MODEL = "chatgpt-gpt-5.6"
 DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
 WEB_SEARCH_TOOL_TYPES = frozenset({"web_search", "web_search_preview"})
@@ -532,14 +534,14 @@ def _resolved_model(runtime: Any, requested: str, default: str) -> str:
     return resolver(requested, default) if resolver else (str(requested or "").strip() or default)
 
 
-def _passthrough_response(response: Any, stream: bool) -> Any:
+def _passthrough_response(response: Any, stream: bool, provider_label: str = "B.AI") -> Any:
     if response.status_code >= 400:
         detail = _read_upstream_error(response)
         try:
             response.close()
         except Exception:
             pass
-        raise HTTPException(status_code=502, detail=f"B.AI HTTP {response.status_code}: {detail}")
+        raise HTTPException(status_code=502, detail=f"{provider_label} HTTP {response.status_code}: {detail}")
     if stream:
         return StreamingResponse(
             response.iter_content(chunk_size=4096),
@@ -563,10 +565,26 @@ def install(runtime: Any) -> None:
     ) -> Any:
         runtime.authorize(authorization, x_api_key)
         requested_model = _resolved_model(runtime, str(payload.get("model") or ""), DEFAULT_PUBLIC_MODEL)
-        if _active_provider(runtime) == "bai":
-            bai_payload = {**payload, "model": requested_model}
-            response = runtime.bai_request("/chat/completions", json_payload=bai_payload, stream=True)
-            return _passthrough_response(response, bool(payload.get("stream", False)))
+        active = _active_provider(runtime)
+        # OpenAI-native providers: forward the payload as-is, only pinning the model.
+        passthrough = {
+            "bai": (runtime.bai_request, "B.AI"),
+            "openrouter": (runtime.openrouter_request, "OpenRouter"),
+            "nim": (runtime.nim_request, "NVIDIA NIM"),
+        }.get(active)
+        if passthrough is not None:
+            requester, provider_label = passthrough
+            response = requester("/chat/completions", json_payload={**payload, "model": requested_model}, stream=True)
+            return _passthrough_response(response, bool(payload.get("stream", False)), provider_label)
+        if active == "notion":
+            notion_response = runtime.notion_request(payload)
+            if bool(payload.get("stream", False)):
+                return StreamingResponse(
+                    iter_notion_chat_stream(notion_response, requested_model),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+                )
+            return JSONResponse(aggregate_notion_chat(notion_response, requested_model))
         upstream_payload = build_openai_chat_payload(payload)
         response = _request(runtime, upstream_payload)
         if bool(payload.get("stream", False)):
@@ -583,8 +601,15 @@ def install(runtime: Any) -> None:
         x_api_key: str | None = Header(default=None),
     ) -> Any:
         runtime.authorize(authorization, x_api_key)
+        active = _active_provider(runtime)
+        unsupported_labels = {"openrouter": "OpenRouter", "notion": "Notion AI", "nim": "NVIDIA NIM"}
+        if active in unsupported_labels:
+            raise HTTPException(
+                status_code=503,
+                detail=f"{unsupported_labels[active]} does not support /v1/responses. Use /v1/chat/completions.",
+            )
         requested_model = str(payload.get("model") or DEFAULT_PUBLIC_MODEL)
-        if _active_provider(runtime) == "bai":
+        if active == "bai":
             bai_payload = {**payload, "model": _resolved_model(runtime, requested_model, DEFAULT_PUBLIC_MODEL)}
             response = runtime.bai_request("/responses", json_payload=bai_payload, stream=True)
             return _passthrough_response(response, bool(payload.get("stream", False)))

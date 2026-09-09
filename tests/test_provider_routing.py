@@ -61,7 +61,7 @@ def test_providers_endpoint_lists_providers(monkeypatch) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["active_provider"] == "chatgpt"
-    assert [p["id"] for p in body["providers"]] == ["chatgpt", "bai"]
+    assert [p["id"] for p in body["providers"]] == ["chatgpt", "bai", "openrouter", "notion", "nim"]
     chatgpt = body["providers"][0]
     assert chatgpt["configured"] is True
     assert "chatgpt-gpt-5.6" in chatgpt["models"]

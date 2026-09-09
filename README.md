@@ -53,11 +53,14 @@ ADMIN_USERNAME
 ADMIN_PASSWORD
 ```
 
-Tùy chọn cho provider B.AI (bật provider thứ hai trong trang admin):
+Tùy chọn cho các provider khác (có thể dán key trực tiếp trong admin thay vì env):
 
 ```text
-BAI_API_KEY     # API key của B.AI (https://api.b.ai)
-BAI_BASE_URL    # mặc định https://api.b.ai/v1
+BAI_API_KEY          # API key của B.AI (https://api.b.ai)
+BAI_BASE_URL         # mặc định https://api.b.ai/v1
+OPENROUTER_API_KEY   # API key OpenRouter (https://openrouter.ai)
+NIM_API_KEY          # API key NVIDIA NIM (https://build.nvidia.com)
+NOTION_COOKIE        # (tùy chọn) cookie Notion; khuyến nghị đăng nhập qua /auth
 ```
 
 Các biến upstream có default:
@@ -266,12 +269,35 @@ Gateway hỗ trợ nhiều provider upstream, chọn trong trang admin (`/auth`)
 | --- | --- | --- | --- |
 | `chatgpt` | ChatGPT/Codex backend (mặc định) | Device login | Đầy đủ tool calling, usage |
 | `bai` | `https://api.b.ai/v1` (OpenAI/Anthropic/Responses compatible) | `BAI_API_KEY` | Passthrough native cả 3 protocol |
+| `openrouter` | `https://openrouter.ai/api/v1` (OpenAI-compatible) | Key dán trong admin (hoặc `OPENROUTER_API_KEY`) | Model list động, lọc sẵn model free (đuôi `:free`) |
+| `notion` | `https://app.notion.com/api/v3` (runInferenceTranscript) | Cookie trình duyệt dán trong admin | Model list động từ `getAvailableModels` theo workspace |
+| `nim` | `https://integrate.api.nvidia.com/v1` (OpenAI-compatible) | Key dán trong admin (hoặc `NIM_API_KEY`) | Model list động, lọc model không chat-capable (NIM là free tier) |
+
+Cấu hình OpenRouter / Notion / NIM ngay trên trang admin:
+
+- **OpenRouter**: dán API key (`sk-or-v1-…`) vào thẻ *OpenRouter*. Danh sách model lấy từ OpenRouter và lọc chỉ giữ model free (`:free`); đặt `OPENROUTER_MODELS_FILTER_MODE=all` để xem toàn bộ catalog.
+- **Notion AI**: copy toàn bộ cookie từ trình duyệt (F12 → Application → Cookies trên notion.com, phải có `token_v2`) dán vào thẻ *Đăng nhập Notion AI*. Gateway gọi `loadUserContent` để nhận diện user/workspace rồi lưu cookie mã hóa trong DB. Lưu ý Notion gắn session với IP đăng nhập — chạy gateway cùng mạng/IP với trình duyệt hoặc đặt proxy nếu cần.
+- **NVIDIA NIM**: dán key (`nvapi-…`) vào thẻ *NVIDIA NIM*. Catalog lấy trực tiếp từ NVIDIA (cache 5 phút) và lọc bỏ model embedding/rerank/OCR…; `NIM_MODELS_FILTER_MODE=all` để tắt lọc, `NIM_FREE_EXCLUDE=từ-khóa` để loại thêm.
+
+Key/cookie provider được mã hóa Fernet trong bảng `gateway_settings` (hoặc bộ nhớ nếu không có `DATABASE_URL`) và tự nạp lại khi restart. API admin liên quan:
+
+```text
+POST /auth/openrouter/key      # {"api_key": "sk-or-v1-…"}
+GET  /auth/openrouter/key      # {"configured": true}
+POST /auth/nim/key             # {"api_key": "nvapi-…"}
+GET  /auth/nim/key             # {"configured": true, "models": [...]}
+POST /auth/notion/login        # {"cookie": "token_v2=…; …"}
+GET  /auth/notion/accounts     # danh sách tài khoản Notion
+DELETE /auth/notion/accounts/{id}
+```
+
+OpenRouter và NIM nói chuẩn OpenAI nên `/v1/chat/completions` được passthrough nguyên bản (stream + non-stream, kể cả tool calling). Hai provider này không hỗ trợ `/v1/responses`; khi được chọn, endpoint đó trả 503 kèm hướng dẫn. Notion không có tool calling native — các message được gộp thành một prompt duy nhất và văn bản trả về được chuyển thành `chat.completion` chuẩn (stream qua bộ parse NDJSON của Notion).
 
 API admin:
 
 ```text
 GET  /auth/providers           # liệt kê provider, model và trạng thái đang chọn
-POST /auth/providers/select    # {"provider": "chatgpt"|"bai", "model": "..."}
+POST /auth/providers/select    # {"provider": "chatgpt"|"bai"|"openrouter"|"notion"|"nim", "model": "..."}
 ```
 
 Lựa chọn được lưu trong bảng `gateway_settings` (hoặc trong bộ nhớ nếu không có `DATABASE_URL`). Khi client gọi model mặc định (`chatgpt-gpt-5.6` hoặc bỏ trống), gateway dùng model admin đã chọn cho provider đang active; model client ghi rõ thì được truyền nguyên. `/v1/models` trả về danh sách model của provider đang active (B.AI được query trực tiếp từ `GET /v1/models` của B.AI với cache 60 giây).

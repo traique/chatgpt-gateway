@@ -13,10 +13,45 @@ from fastapi import Header, HTTPException, Request
 
 PROVIDER_CHATGPT = "chatgpt"
 PROVIDER_BAI = "bai"
-KNOWN_PROVIDERS = (PROVIDER_CHATGPT, PROVIDER_BAI)
+PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_NOTION = "notion"
+PROVIDER_NIM = "nim"
+KNOWN_PROVIDERS = (PROVIDER_CHATGPT, PROVIDER_BAI, PROVIDER_OPENROUTER, PROVIDER_NOTION, PROVIDER_NIM)
 DEFAULT_BAI_BASE_URL = "https://api.b.ai/v1"
 DEFAULT_MODEL_ALIASES = frozenset({"", "chatgpt-gpt-5.6", "gpt-5.6"})
 CHATGPT_ADMIN_MODELS = ("chatgpt-gpt-5.6", "gpt-5.6-terra", "gpt-5.6-codex")
+PROVIDER_LABELS = {
+    PROVIDER_CHATGPT: "ChatGPT / Codex",
+    PROVIDER_BAI: "B.AI",
+    PROVIDER_OPENROUTER: "OpenRouter",
+    PROVIDER_NOTION: "Notion AI",
+    PROVIDER_NIM: "NVIDIA NIM",
+}
+OPENROUTER_PUBLIC_CATALOG: tuple[str, ...] = (
+    "openrouter/auto",
+    "deepseek/deepseek-chat-v4:free",
+    "meta-llama/llama-4-maverick:free",
+    "qwen/qwen3-coder:free",
+    "mistralai/mistral-small:free",
+)
+NOTION_PUBLIC_CATALOG: tuple[str, ...] = (
+    "notion-ai",
+    "opus-4.8",
+    "sonnet-5",
+    "sonnet-4.6",
+    "haiku-4.5",
+    "gpt-5.6-terra",
+    "gemini-3.5-flash",
+    "grok-4.5",
+    "glm-5.2",
+)
+NIM_PUBLIC_CATALOG: tuple[str, ...] = (
+    "meta/llama-3.3-70b-instruct",
+    "deepseek-ai/deepseek-r1",
+    "qwen/qwen2.5-coder-32b-instruct",
+    "mistralai/mistral-large-2-instruct",
+    "google/gemma-3-27b-it",
+)
 MODELS_CACHE_TTL_SECONDS = 60
 
 _models_cache: dict[str, Any] = {"ts": 0.0, "models": []}
@@ -62,6 +97,25 @@ def _get_setting(runtime: Any, key: str) -> str:
             _settings_table_ready = True
         row = connection.execute("SELECT value FROM gateway_settings WHERE key=%s", (key,)).fetchone()
     return str(row[0]) if row else ""
+
+
+def load_secret_setting(runtime: Any, key: str) -> str:
+    """Read an encrypted setting; returns '' when missing/undecryptable."""
+    if not runtime.DATABASE_URL:
+        return ""
+    stored = _get_setting(runtime, key)
+    if not stored:
+        return ""
+    try:
+        return runtime.decrypt_token(stored)
+    except Exception:
+        return ""
+
+
+def save_secret_setting(runtime: Any, key: str, value: str) -> None:
+    if not runtime.DATABASE_URL:
+        return
+    _set_setting(runtime, key, runtime.encrypt_token(value))
 
 
 def _set_setting(runtime: Any, key: str, value: str) -> None:
@@ -327,6 +381,15 @@ def install(runtime: Any) -> None:
     runtime.set_client_policy = set_client_policy
     runtime.get_client_policy = get_client_policy
 
+    # Lazy import to avoid a circular dependency (openrouter_provider reads settings helpers).
+    from faable.nim_provider import install as install_nim_provider
+    from faable.notion_provider import install as install_notion_provider
+    from faable.openrouter_provider import install as install_openrouter_provider
+
+    install_notion_provider(runtime)
+    install_openrouter_provider(runtime)
+    install_nim_provider(runtime)
+
     runtime.app.router.routes[:] = [
         route for route in runtime.app.router.routes if getattr(route, "path", None) != "/v1/models"
     ]
@@ -337,9 +400,19 @@ def install(runtime: Any) -> None:
     ) -> dict[str, Any]:
         runtime.authorize(authorization, x_api_key)
         created = int(time.time())
-        if get_active_provider(runtime) == PROVIDER_BAI:
+        active = get_active_provider(runtime)
+        if active == PROVIDER_BAI:
             catalog = bai_list_models(runtime)
             owned_by = "b-ai"
+        elif active == PROVIDER_OPENROUTER:
+            catalog = runtime.openrouter_list_models() or list(OPENROUTER_PUBLIC_CATALOG)
+            owned_by = "openrouter"
+        elif active == PROVIDER_NOTION:
+            catalog = runtime.notion_list_models() if notion_ready else list(NOTION_PUBLIC_CATALOG)
+            owned_by = "notion"
+        elif active == PROVIDER_NIM:
+            catalog = runtime.nim_list_models() or list(NIM_PUBLIC_CATALOG)
+            owned_by = "nvidia-nim"
         else:
             catalog = list(getattr(runtime, "PUBLIC_MODEL_CATALOG", ("chatgpt-gpt-5.6",)))
             owned_by = "openai-chatgpt"
@@ -350,13 +423,18 @@ def install(runtime: Any) -> None:
 
     def providers(request: Request) -> dict[str, Any]:
         runtime.require_admin(request)
-        configured = bai_configured(runtime)
+        openrouter_ready = runtime.openrouter_configured()
+        notion_ready = runtime.notion_configured()
+        nim_ready = runtime.nim_configured()
         return {
             "active_provider": get_active_provider(runtime),
             "active_model": get_active_model(runtime),
             "providers": [
-                {"id": PROVIDER_CHATGPT, "label": "ChatGPT / Codex", "configured": True, "models": list(CHATGPT_ADMIN_MODELS)},
-                {"id": PROVIDER_BAI, "label": "B.AI", "configured": configured, "models": bai_list_models(runtime) if configured else []},
+                {"id": PROVIDER_CHATGPT, "label": PROVIDER_LABELS[PROVIDER_CHATGPT], "configured": True, "models": list(CHATGPT_ADMIN_MODELS)},
+                {"id": PROVIDER_BAI, "label": PROVIDER_LABELS[PROVIDER_BAI], "configured": bai_configured(runtime), "models": bai_list_models(runtime) if bai_configured(runtime) else []},
+                {"id": PROVIDER_OPENROUTER, "label": PROVIDER_LABELS[PROVIDER_OPENROUTER], "configured": openrouter_ready, "models": runtime.openrouter_list_models() if openrouter_ready else list(OPENROUTER_PUBLIC_CATALOG)},
+                {"id": PROVIDER_NOTION, "label": PROVIDER_LABELS[PROVIDER_NOTION], "configured": notion_ready, "models": runtime.notion_list_models() if notion_ready else list(NOTION_PUBLIC_CATALOG)},
+                {"id": PROVIDER_NIM, "label": PROVIDER_LABELS[PROVIDER_NIM], "configured": nim_ready, "models": runtime.nim_list_models() if nim_ready else list(NIM_PUBLIC_CATALOG)},
             ],
         }
 
@@ -382,7 +460,7 @@ def install(runtime: Any) -> None:
         label = str(payload.get("label") or "Client").strip()[:100] or "Client"
         provider = payload.get("provider")
         if provider not in KNOWN_PROVIDERS:
-            raise HTTPException(status_code=400, detail="provider must be 'chatgpt' or 'bai'.")
+            raise HTTPException(status_code=400, detail=f"provider must be one of: {', '.join(KNOWN_PROVIDERS)}.")
         model = str(payload.get("model") or "").strip()[:200]
         key = str(payload.get("key") or "").strip()
         if not key:

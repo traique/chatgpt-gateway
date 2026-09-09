@@ -458,6 +458,227 @@ def _http_error_type(status_code: int) -> str:
     return "api_error"
 
 
+def _anthropic_to_chat_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = []
+    system_text = _system_text(payload.get("system"))
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "user")
+        content = message.get("content", "")
+        if isinstance(content, str):
+            if content:
+                messages.append({"role": role if role in ("user", "assistant") else "user", "content": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, str]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                text_parts.append(str(part.get("text") or ""))
+            elif part_type == "tool_use":
+                tool_calls.append({
+                    "id": str(part.get("id") or ""),
+                    "type": "function",
+                    "function": {"name": str(part.get("name") or ""), "arguments": json.dumps(part.get("input") or {}, ensure_ascii=False)},
+                })
+            elif part_type == "tool_result":
+                tool_results.append({
+                    "tool_use_id": str(part.get("tool_use_id") or ""),
+                    "output": _tool_result_output(part.get("content")),
+                })
+        if tool_results:
+            for result in tool_results:
+                messages.append({"role": "tool", "tool_call_id": result["tool_use_id"], "content": result["output"]})
+            continue
+        joined_text = "\n".join(part for part in text_parts if part)
+        message_out: dict[str, Any] = {"role": role if role in ("user", "assistant") else "user", "content": joined_text or None}
+        if tool_calls:
+            message_out["tool_calls"] = tool_calls
+        if message_out["content"] is not None or tool_calls:
+            messages.append(message_out)
+
+    chat_payload: dict[str, Any] = {"model": model, "messages": messages}
+    raw_tools = payload.get("tools")
+    if isinstance(raw_tools, list) and raw_tools:
+        tools = []
+        for raw_tool in raw_tools:
+            if not isinstance(raw_tool, dict):
+                continue
+            tool = _convert_anthropic_tool(raw_tool)
+            if tool is not None:
+                tools.append({"type": "function", "function": {key: value for key, value in tool.items() if key != "type"}})
+        if tools:
+            chat_payload["tools"] = tools
+    tool_choice = _tool_choice_from_anthropic(payload.get("tool_choice"))
+    if tool_choice is not None:
+        if isinstance(tool_choice, dict):
+            chat_payload["tool_choice"] = {"type": "function", "function": {"name": tool_choice["name"]}}
+        elif tool_choice == "required":
+            chat_payload["tool_choice"] = "required"
+        else:
+            chat_payload["tool_choice"] = "auto"
+    return chat_payload
+
+
+def _chat_completion_to_anthropic_message(completion: dict[str, Any], model: str) -> dict[str, Any]:
+    choices = completion.get("choices") if isinstance(completion.get("choices"), list) else []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    content_blocks: list[dict[str, Any]] = []
+    text = str(message.get("content") or "")
+    if text:
+        content_blocks.append({"type": "text", "text": text})
+    tool_use = False
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        raw_arguments = str(function.get("arguments") or "{}")
+        try:
+            tool_input = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            tool_input = {"_raw": raw_arguments}
+        tool_use = True
+        content_blocks.append({
+            "type": "tool_use",
+            "id": str(call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"),
+            "name": str(function.get("name") or ""),
+            "input": tool_input,
+        })
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+    usage = completion.get("usage") if isinstance(completion.get("usage"), dict) else {}
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": "tool_use" if tool_use else "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("completion_tokens") or 0),
+        },
+    }
+
+
+def _anthropic_sse_from_chat_stream(response: Any, model: str):
+    """Convert an OpenAI chat.completion.chunk SSE stream into Anthropic events."""
+    completion_id = f"msg_{uuid.uuid4().hex[:24]}"
+    yield _sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": completion_id, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    })
+    block_index = -1
+    text_open = False
+    tool_blocks: dict[int, dict[str, Any]] = {}
+    output_tokens = 0
+
+    def close_block() -> str | None:
+        nonlocal text_open, block_index
+        if not text_open:
+            return None
+        text_open = False
+        return _sse_event("content_block_stop", {"type": "content_block_stop", "index": block_index})
+
+    try:
+        for line in response.iter_lines():
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", "ignore")
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            choices = event.get("choices") if isinstance(event.get("choices"), list) else []
+            choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                output_tokens = int(usage.get("completion_tokens") or output_tokens or 0)
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                if not text_open:
+                    close = close_block()
+                    if close:
+                        yield close
+                    block_index += 1
+                    text_open = True
+                    yield _sse_event("content_block_start", {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    })
+                yield _sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                })
+            for call in delta.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                call_index = int(call.get("index") or 0)
+                state = tool_blocks.get(call_index)
+                if state is None:
+                    close = close_block()
+                    if close:
+                        yield close
+                    block_index += 1
+                    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    tool_blocks[call_index] = {"index": block_index, "arguments": ""}
+                    state = tool_blocks[call_index]
+                    yield _sse_event("content_block_start", {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": str(call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"),
+                            "name": str(function.get("name") or ""),
+                            "input": {},
+                        },
+                    })
+                arguments = (call.get("function") or {}).get("arguments")
+                if isinstance(arguments, str) and arguments:
+                    state["arguments"] += arguments
+                    yield _sse_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": state["index"],
+                        "delta": {"type": "input_json_delta", "partial_json": arguments},
+                    })
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+    close = close_block()
+    if close:
+        yield close
+    yield _sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "tool_use" if tool_blocks else "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })
+    yield _sse_event("message_stop", {"type": "message_stop"})
+
+
 def _bai_messages_passthrough(runtime: Any, payload: dict[str, Any], requested_model: str) -> Any:
     """B.AI natively speaks the Anthropic Messages protocol — forward as-is."""
     if not getattr(runtime, "BAI_API_KEY", ""):
@@ -503,6 +724,45 @@ def _bai_messages_passthrough(runtime: Any, payload: dict[str, Any], requested_m
         return _anthropic_error_response("api_error", "B.AI returned a non-JSON response.", 502)
 
 
+def _native_messages_passthrough(runtime: Any, payload: dict[str, Any], requested_model: str, *, provider: str) -> Any:
+    """Route an Anthropic Messages request to OpenRouter/NIM by converting
+    Anthropic format to their OpenAI-native /chat/completions and back."""
+    requester = runtime.openrouter_request if provider == "openrouter" else runtime.nim_request
+    provider_label = "OpenRouter" if provider == "openrouter" else "NVIDIA NIM"
+    resolver = getattr(runtime, "resolve_model", None)
+    effective_model = resolver(requested_model, DEFAULT_PUBLIC_MODEL) if resolver else (requested_model or DEFAULT_PUBLIC_MODEL)
+    try:
+        chat_payload = _anthropic_to_chat_payload(payload, effective_model)
+        response = requester("/chat/completions", json_payload=chat_payload, stream=bool(payload.get("stream", False)), timeout=120)
+    except HTTPException as error:
+        return _anthropic_error_response("api_error", str(error.detail), error.status_code or 502)
+    except Exception as error:
+        return _anthropic_error_response("api_error", f"{provider_label} transport failed: {error}", 502)
+    if response.status_code >= 400:
+        detail = _read_upstream_error(response)
+        try:
+            response.close()
+        except Exception:
+            pass
+        return _anthropic_error_response(
+            _http_error_type(response.status_code),
+            f"{provider_label} HTTP {response.status_code}: {detail}",
+            response.status_code,
+        )
+    if bool(payload.get("stream", False)):
+        return StreamingResponse(
+            _anthropic_sse_from_chat_stream(response, effective_model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+    try:
+        upstream = response.json()
+        response.close()
+    except (TypeError, ValueError):
+        return _anthropic_error_response("api_error", f"{provider_label} returned a non-JSON response.", 502)
+    return JSONResponse(_chat_completion_to_anthropic_message(upstream, effective_model))
+
+
 def install(runtime: Any) -> None:
     runtime.app.router.routes[:] = [
         route for route in runtime.app.router.routes if getattr(route, "path", None) != "/v1/messages"
@@ -516,8 +776,17 @@ def install(runtime: Any) -> None:
         try:
             runtime.authorize(authorization, x_api_key)
             requested_model = str(payload.get("model") or "")
-            if _active_provider(runtime) == "bai":
+            active = _active_provider(runtime)
+            if active == "bai":
                 return _bai_messages_passthrough(runtime, payload, requested_model)
+            if active in ("openrouter", "nim"):
+                return _native_messages_passthrough(runtime, payload, requested_model, provider=active)
+            if active == "notion":
+                return _anthropic_error_response(
+                    "api_error",
+                    "Notion AI does not support the Anthropic Messages endpoint. Switch provider or use /v1/chat/completions.",
+                    503,
+                )
             resolver = getattr(runtime, "resolve_model", None)
             effective_model = resolver(requested_model, DEFAULT_PUBLIC_MODEL) if resolver else (requested_model or DEFAULT_PUBLIC_MODEL)
             upstream_payload = build_responses_payload_from_anthropic(payload)
