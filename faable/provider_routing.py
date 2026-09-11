@@ -171,6 +171,36 @@ def resolve_model(runtime: Any, requested: Any, default: str) -> str:
     return model or default
 
 
+def resolve_provider_model(runtime: Any, provider: str, requested: Any) -> str:
+    """Resolve the model for a catalog-backed provider. ZCode-style clients often
+    hardcode a model id (e.g. glm-5.3-flash) that the active provider does not
+    carry; forwarding it verbatim makes the upstream fail. If the requested id is
+    unknown to the provider, fall back to the client key's model, the admin's
+    global pick, or the first entry of the provider catalog."""
+    model = str(requested or "").strip()
+    if provider == PROVIDER_BAI:
+        catalog = bai_list_models(runtime)
+    elif provider == PROVIDER_OPENROUTER:
+        catalog = runtime.openrouter_list_models()
+    elif provider == PROVIDER_NOTION:
+        catalog = runtime.notion_list_models()
+    elif provider == PROVIDER_NIM:
+        catalog = runtime.nim_list_models()
+    else:
+        catalog = []
+    if catalog and model and model not in DEFAULT_MODEL_ALIASES and model in catalog:
+        return model
+    policy = get_client_policy()
+    if policy and policy.get("model"):
+        return policy["model"]
+    active = get_active_model(runtime)
+    if active:
+        return active
+    if catalog:
+        return catalog[0]
+    return model
+
+
 def _ensure_client_table(connection: Any) -> None:
     global _client_table_ready
     if not _client_table_ready:
@@ -375,6 +405,7 @@ def install(runtime: Any) -> None:
     runtime.set_active_provider_model = lambda provider, model="": set_active_provider_model(runtime, provider, model)
     runtime.bai_configured = lambda: bai_configured(runtime)
     runtime.resolve_model = lambda requested, default: resolve_model(runtime, requested, default)
+    runtime.resolve_provider_model = lambda provider, requested: resolve_provider_model(runtime, provider, requested)
     runtime.bai_request = lambda path, **kwargs: bai_request(runtime, path, **kwargs)
     runtime.bai_list_models = lambda: bai_list_models(runtime)
     runtime.lookup_client_policy = lambda supplied: _lookup_client_policy(runtime, supplied)
@@ -408,7 +439,7 @@ def install(runtime: Any) -> None:
             catalog = runtime.openrouter_list_models() or list(OPENROUTER_PUBLIC_CATALOG)
             owned_by = "openrouter"
         elif active == PROVIDER_NOTION:
-            catalog = runtime.notion_list_models() if notion_ready else list(NOTION_PUBLIC_CATALOG)
+            catalog = runtime.notion_list_models() or list(NOTION_PUBLIC_CATALOG)
             owned_by = "notion"
         elif active == PROVIDER_NIM:
             catalog = runtime.nim_list_models() or list(NIM_PUBLIC_CATALOG)

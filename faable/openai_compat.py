@@ -551,7 +551,7 @@ def _passthrough_response(response: Any, stream: bool, provider_label: str = "B.
     try:
         return JSONResponse(response.json())
     except (TypeError, ValueError) as error:
-        raise HTTPException(status_code=502, detail="B.AI returned a non-JSON response.") from error
+        raise HTTPException(status_code=502, detail=f"{provider_label} returned a non-JSON response.") from error
 
 
 def install(runtime: Any) -> None:
@@ -564,8 +564,15 @@ def install(runtime: Any) -> None:
         x_api_key: str | None = Header(default=None),
     ) -> Any:
         runtime.authorize(authorization, x_api_key)
-        requested_model = _resolved_model(runtime, str(payload.get("model") or ""), DEFAULT_PUBLIC_MODEL)
         active = _active_provider(runtime)
+        # Catalog-backed providers: resolve the requested id against the provider
+        # catalog, falling back to the admin pick when the client hardcodes an
+        # unknown model (ZCode sends glm-5.3-flash regardless of the provider).
+        provider_resolver = getattr(runtime, "resolve_provider_model", None)
+        if active != "chatgpt" and provider_resolver is not None:
+            requested_model = provider_resolver(active, str(payload.get("model") or ""))
+        else:
+            requested_model = _resolved_model(runtime, str(payload.get("model") or ""), DEFAULT_PUBLIC_MODEL)
         # OpenAI-native providers: forward the payload as-is, only pinning the model.
         passthrough = {
             "bai": (runtime.bai_request, "B.AI"),
@@ -574,7 +581,9 @@ def install(runtime: Any) -> None:
         }.get(active)
         if passthrough is not None:
             requester, provider_label = passthrough
-            response = requester("/chat/completions", json_payload={**payload, "model": requested_model}, stream=True)
+            # Stream upstream only when the client asked for it — curl_cffi
+            # responses opened in stream mode cannot be parsed with .json().
+            response = requester("/chat/completions", json_payload={**payload, "model": requested_model}, stream=bool(payload.get("stream", False)))
             return _passthrough_response(response, bool(payload.get("stream", False)), provider_label)
         if active == "notion":
             notion_response = runtime.notion_request(payload)
@@ -611,7 +620,7 @@ def install(runtime: Any) -> None:
         requested_model = str(payload.get("model") or DEFAULT_PUBLIC_MODEL)
         if active == "bai":
             bai_payload = {**payload, "model": _resolved_model(runtime, requested_model, DEFAULT_PUBLIC_MODEL)}
-            response = runtime.bai_request("/responses", json_payload=bai_payload, stream=True)
+            response = runtime.bai_request("/responses", json_payload=bai_payload, stream=bool(payload.get("stream", False)))
             return _passthrough_response(response, bool(payload.get("stream", False)))
         upstream_payload = dict(payload)
         upstream_payload["model"] = normalize_codex_model(requested_model)

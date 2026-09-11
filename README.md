@@ -270,14 +270,16 @@ Gateway hỗ trợ nhiều provider upstream, chọn trong trang admin (`/auth`)
 | `chatgpt` | ChatGPT/Codex backend (mặc định) | Device login | Đầy đủ tool calling, usage |
 | `bai` | `https://api.b.ai/v1` (OpenAI/Anthropic/Responses compatible) | `BAI_API_KEY` | Passthrough native cả 3 protocol |
 | `openrouter` | `https://openrouter.ai/api/v1` (OpenAI-compatible) | Key dán trong admin (hoặc `OPENROUTER_API_KEY`) | Model list động, lọc sẵn model free (đuôi `:free`) |
-| `notion` | `https://app.notion.com/api/v3` (runInferenceTranscript) | Cookie trình duyệt dán trong admin | Model list động từ `getAvailableModels` theo workspace |
+| `notion` | `https://app.notion.com/api/v3` (runInferenceTranscript) | Cookie tự nhận qua bookmarklet hoặc dán tay trong admin | Model list động từ `getAvailableModels` theo workspace |
 | `nim` | `https://integrate.api.nvidia.com/v1` (OpenAI-compatible) | Key dán trong admin (hoặc `NIM_API_KEY`) | Model list động, lọc model không chat-capable (NIM là free tier) |
 
 Cấu hình OpenRouter / Notion / NIM ngay trên trang admin:
 
 - **OpenRouter**: dán API key (`sk-or-v1-…`) vào thẻ *OpenRouter*. Danh sách model lấy từ OpenRouter và lọc chỉ giữ model free (`:free`); đặt `OPENROUTER_MODELS_FILTER_MODE=all` để xem toàn bộ catalog.
-- **Notion AI**: copy toàn bộ cookie từ trình duyệt (F12 → Application → Cookies trên notion.com, phải có `token_v2`) dán vào thẻ *Đăng nhập Notion AI*. Gateway gọi `loadUserContent` để nhận diện user/workspace rồi lưu cookie mã hóa trong DB. Lưu ý Notion gắn session với IP đăng nhập — chạy gateway cùng mạng/IP với trình duyệt hoặc đặt proxy nếu cần.
+- **Notion AI**: nhấn **Đăng nhập Notion** trong thẻ *Đăng nhập Notion AI*, mở trang notion.com và đăng nhập như bình thường, rồi nhấn bookmark **→ Gateway** (kéo vào thanh bookmark một lần lúc thiết lập) ngay trên tab Notion — gateway tự nhận cookie, không cần F12. Vẫn có thể dán cookie tay (F12 → Application → Cookies, phải có `token_v2`) qua mục *Nhập cookie thủ công*. Gateway gọi `loadUserContent` để nhận diện user/workspace rồi lưu cookie mã hóa trong DB. Lưu ý Notion gắn session với IP đăng nhập — chạy gateway cùng mạng/IP với trình duyệt hoặc đặt proxy nếu cần.
 - **NVIDIA NIM**: dán key (`nvapi-…`) vào thẻ *NVIDIA NIM*. Catalog lấy trực tiếp từ NVIDIA (cache 5 phút) và lọc bỏ model embedding/rerank/OCR…; `NIM_MODELS_FILTER_MODE=all` để tắt lọc, `NIM_FREE_EXCLUDE=từ-khóa` để loại thêm.
+
+Với B.AI / OpenRouter / Notion / NIM, model do client gửi được đối chiếu với catalog của provider đang hoạt động: khớp thì giữ nguyên; nếu client hardcode một model không tồn tại (VD ZCode luôn gửi `glm-5.3-flash`), gateway tự thay bằng model admin đã chọn cho provider đó, hoặc model đầu tiên trong catalog — client không cần đổi cấu hình khi đổi provider. Model hợp lệ luôn được chuyển nguyên bản.
 
 Key/cookie provider được mã hóa Fernet trong bảng `gateway_settings` (hoặc bộ nhớ nếu không có `DATABASE_URL`) và tự nạp lại khi restart. API admin liên quan:
 
@@ -286,7 +288,9 @@ POST /auth/openrouter/key      # {"api_key": "sk-or-v1-…"}
 GET  /auth/openrouter/key      # {"configured": true}
 POST /auth/nim/key             # {"api_key": "nvapi-…"}
 GET  /auth/nim/key             # {"configured": true, "models": [...]}
-POST /auth/notion/login        # {"cookie": "token_v2=…; …"}
+POST /auth/notion/start        # tạo phiên đăng nhập, trả token + login_url
+GET  /auth/notion/capture?t=…  # trang nhận cookie khi bookmarklet điều hướng về
+POST /auth/notion/login        # {"cookie": "token_v2=…; …"} (trang capture và dán tay đều dùng)
 GET  /auth/notion/accounts     # danh sách tài khoản Notion
 DELETE /auth/notion/accounts/{id}
 ```

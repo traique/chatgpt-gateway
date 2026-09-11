@@ -683,8 +683,12 @@ def _bai_messages_passthrough(runtime: Any, payload: dict[str, Any], requested_m
     """B.AI natively speaks the Anthropic Messages protocol — forward as-is."""
     if not getattr(runtime, "BAI_API_KEY", ""):
         return _anthropic_error_response("authentication_error", "BAI_API_KEY is not configured.", 503)
-    resolver = getattr(runtime, "resolve_model", None)
-    effective_model = resolver(requested_model, DEFAULT_PUBLIC_MODEL) if resolver else (requested_model or DEFAULT_PUBLIC_MODEL)
+    provider_resolver = getattr(runtime, "resolve_provider_model", None)
+    if provider_resolver is not None:
+        effective_model = provider_resolver("bai", requested_model)
+    else:
+        resolver = getattr(runtime, "resolve_model", None)
+        effective_model = resolver(requested_model, DEFAULT_PUBLIC_MODEL) if resolver else (requested_model or DEFAULT_PUBLIC_MODEL)
     bai_payload = {**payload, "model": effective_model}
     try:
         response = runtime.requests.post(
@@ -729,8 +733,12 @@ def _native_messages_passthrough(runtime: Any, payload: dict[str, Any], requeste
     Anthropic format to their OpenAI-native /chat/completions and back."""
     requester = runtime.openrouter_request if provider == "openrouter" else runtime.nim_request
     provider_label = "OpenRouter" if provider == "openrouter" else "NVIDIA NIM"
-    resolver = getattr(runtime, "resolve_model", None)
-    effective_model = resolver(requested_model, DEFAULT_PUBLIC_MODEL) if resolver else (requested_model or DEFAULT_PUBLIC_MODEL)
+    provider_resolver = getattr(runtime, "resolve_provider_model", None)
+    if provider_resolver is not None:
+        effective_model = provider_resolver(provider, requested_model)
+    else:
+        resolver = getattr(runtime, "resolve_model", None)
+        effective_model = resolver(requested_model, DEFAULT_PUBLIC_MODEL) if resolver else (requested_model or DEFAULT_PUBLIC_MODEL)
     try:
         chat_payload = _anthropic_to_chat_payload(payload, effective_model)
         response = requester("/chat/completions", json_payload=chat_payload, stream=bool(payload.get("stream", False)), timeout=120)
