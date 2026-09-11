@@ -1,23 +1,27 @@
 """Notion AI provider: browser-cookie login (token_v2) + runInferenceTranscript.
 
-Login flow mirrors the ChatGPT device-login UX: the admin pastes the Notion
-browser cookie string into /auth, the gateway resolves user/space info via
-Notion's loadUserContent endpoint and stores the cookie encrypted in the
-database. Chat requests are translated to Notion's runInferenceTranscript
-NDJSON endpoint and streamed back as OpenAI SSE chunks.
+Login flow mirrors the ChatGPT device-login UX: the admin opens notion.com,
+signs in normally, then clicks the "→ Gateway" bookmarklet on that tab; the
+gateway receives the browser cookie, resolves user/space info via Notion's
+loadUserContent endpoint and stores the cookie encrypted in the database.
+Manual cookie paste is still supported as a fallback. Chat requests are
+translated to Notion's runInferenceTranscript NDJSON endpoint and streamed
+back as OpenAI SSE chunks.
 """
 from __future__ import annotations
 
 import json
 import re
+import secrets
 import time
 import uuid
 from typing import Any
 
 from fastapi import HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 NOTION_API_BASE = "https://app.notion.com/api/v3"
+NOTION_LOGIN_URL = "https://www.notion.com/login"
 NOTION_IMPERSONATE = "chrome131"
 DEFAULT_NOTION_CLIENT_VERSION = "23.13.20260710.0022"
 DEFAULT_NOTION_USER_AGENT = (
@@ -74,6 +78,9 @@ NOTION_MODELS_CACHE_TTL_SECONDS = 300
 
 _memory_notion_accounts: dict[str, dict[str, Any]] = {}
 _notion_table_ready = False
+_memory_notion_login_tokens: dict[str, int] = {}
+_notion_login_table_ready = False
+NOTION_LOGIN_TOKEN_TTL_MS = 15 * 60 * 1000
 _notion_models_cache: dict[str, Any] = {"ts": 0.0, "alias_map": {}, "models": []}
 
 
@@ -288,6 +295,47 @@ def _ensure_notion_table(connection: Any) -> None:
             "status TEXT NOT NULL DEFAULT 'active', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)"
         )
         _notion_table_ready = True
+
+
+def _ensure_notion_login_table(connection: Any) -> None:
+    global _notion_login_table_ready
+    if not _notion_login_table_ready:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS notion_login_tokens ("
+            "token TEXT PRIMARY KEY, created_at BIGINT NOT NULL)"
+        )
+        _notion_login_table_ready = True
+
+
+def _create_notion_login_token(runtime: Any) -> str:
+    token = secrets.token_urlsafe(24)
+    now = int(time.time() * 1000)
+    if not runtime.DATABASE_URL:
+        for created in [k for k, v in _memory_notion_login_tokens.items() if now - v > NOTION_LOGIN_TOKEN_TTL_MS]:
+            _memory_notion_login_tokens.pop(created, None)
+        _memory_notion_login_tokens[token] = now
+        return token
+    with runtime.db() as connection:
+        _ensure_notion_login_table(connection)
+        connection.execute("DELETE FROM notion_login_tokens WHERE created_at < %s", (now - NOTION_LOGIN_TOKEN_TTL_MS,))
+        connection.execute("INSERT INTO notion_login_tokens (token, created_at) VALUES (%s,%s)", (token, now))
+    return token
+
+
+def _consume_notion_login_token(runtime: Any, token: str) -> bool:
+    if not token:
+        return False
+    now = int(time.time() * 1000)
+    if not runtime.DATABASE_URL:
+        created = _memory_notion_login_tokens.pop(token, None)
+        return created is not None and now - created <= NOTION_LOGIN_TOKEN_TTL_MS
+    with runtime.db() as connection:
+        _ensure_notion_login_table(connection)
+        row = connection.execute("SELECT created_at FROM notion_login_tokens WHERE token=%s", (token,)).fetchone()
+        if not row:
+            return False
+        connection.execute("DELETE FROM notion_login_tokens WHERE token=%s", (token,))
+    return now - int(row[0]) <= NOTION_LOGIN_TOKEN_TTL_MS
 
 
 def _active_notion_row(runtime: Any) -> dict[str, Any] | None:
@@ -872,6 +920,11 @@ def aggregate_notion_chat(response: Any, requested_model: str) -> dict[str, Any]
     return completion
 
 
+NOTION_CAPTURE_HTML = """<!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Notion &rarr; Gateway</title><style>:root{font-family:system-ui,-apple-system,sans-serif;color:#111827;background:#f3f4f6}*{box-sizing:border-box}body{margin:0;padding:18px}.app{max-width:560px;margin:auto}.card{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 4px 16px #0000000a}h1{margin:0 0 8px;font-size:22px}.muted{font-size:14px;color:#6b7280;line-height:1.6}button{min-height:48px;border:0;border-radius:12px;background:#111827;color:#fff;font:inherit;font-weight:650;padding:12px;margin-top:14px;width:100%}.hidden{display:none}</style></head><body><main class='app'><section class='card'><h1>Notion &rarr; Gateway</h1><div id='msg' class='muted'>Đang nhận cookie từ tab Notion…</div><button id='back' class='hidden' onclick="location.href='/auth'">Quay lại trang quản trị</button></section></main><script>(async()=>{const m=document.getElementById('msg'),b=document.getElementById('back');const done=t=>{m.textContent=t;b.classList.remove('hidden')};let c='';try{c=decodeURIComponent(location.hash.slice(1))}catch(e){}history.replaceState(null,'',location.pathname+location.search);if(!c.toLowerCase().includes('token_v2='))return done('Không thấy cookie Notion (token_v2). Hãy đăng nhập notion.com rồi nhấn bookmark → Gateway ngay trên tab đó.');try{const r=await fetch('/auth/notion/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cookie:c,label:'Notion (web)'})});const d=await r.json().catch(()=>({}));if(r.ok)done('✓ Đã đăng nhập Notion thành công'+(d.data&&d.data[0]&&d.data[0].space_name?' — workspace: '+d.data[0].space_name:'')+'. Bạn có thể đóng trang này.');else done('Lỗi: '+(d.detail||('HTTP '+r.status))+(r.status===401?' — phiên quản trị hết hạn, hãy mở /auth, đăng nhập rồi thử lại từ đầu.':''))}catch(e){done('Lỗi: '+e.message)}})()</script></body></html>"""
+
+NOTION_CAPTURE_INVALID_HTML = """<!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Notion &rarr; Gateway</title><style>:root{font-family:system-ui,-apple-system,sans-serif;color:#111827;background:#f3f4f6}*{box-sizing:border-box}body{margin:0;padding:18px}.app{max-width:560px;margin:auto}.card{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 4px 16px #0000000a}h1{margin:0 0 8px;font-size:22px}.muted{font-size:14px;color:#6b7280;line-height:1.6}a{color:#111827}</style></head><body><main class='app'><section class='card'><h1>Notion &rarr; Gateway</h1><div class='muted'>Liên kết đăng nhập đã hết hạn hoặc đã được dùng. Hãy mở <a href='/auth'>trang quản trị</a>, nhấn “Đăng nhập Notion” lần nữa rồi lặp lại các bước.</div></section></main></body></html>"""
+
+
 def install(runtime: Any) -> None:
     runtime.notion_bootstrap = lambda cookie: bootstrap_notion_account(runtime, cookie)
     runtime.notion_configured = lambda: notion_configured(runtime)
@@ -898,6 +951,18 @@ def install(runtime: Any) -> None:
         disable_notion_account(runtime, account_id)
         return {"ok": True, "data": notion_account_rows(runtime)}
 
+    def notion_start(request: Request) -> dict[str, Any]:
+        runtime.require_admin(request)
+        return {"token": _create_notion_login_token(runtime), "login_url": NOTION_LOGIN_URL}
+
+    def notion_capture(request: Request) -> HTMLResponse:
+        token = str(request.query_params.get("t") or "")
+        if not _consume_notion_login_token(runtime, token):
+            return HTMLResponse(NOTION_CAPTURE_INVALID_HTML, status_code=400)
+        return HTMLResponse(NOTION_CAPTURE_HTML)
+
+    runtime.app.add_api_route("/auth/notion/start", notion_start, methods=["POST"])
+    runtime.app.add_api_route("/auth/notion/capture", notion_capture, methods=["GET"])
     runtime.app.add_api_route("/auth/notion/login", notion_login, methods=["POST"])
     runtime.app.add_api_route("/auth/notion/accounts", notion_accounts, methods=["GET"])
     runtime.app.add_api_route("/auth/notion/accounts/{account_id}", notion_disable, methods=["DELETE"])
