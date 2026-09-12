@@ -584,7 +584,9 @@ def install(runtime: Any) -> None:
             requester, provider_label = passthrough
             # Stream upstream only when the client asked for it — curl_cffi
             # responses opened in stream mode cannot be parsed with .json().
-            response = requester("/chat/completions", json_payload={**payload, "model": requested_model}, stream=bool(payload.get("stream", False)))
+            sanitizer = getattr(runtime, "sanitize_chat_payload", None)
+            upstream_payload = sanitizer(active, payload, requested_model) if sanitizer else {**payload, "model": requested_model}
+            response = requester("/chat/completions", json_payload=upstream_payload, stream=bool(payload.get("stream", False)))
             return _passthrough_response(response, bool(payload.get("stream", False)), provider_label)
         if active == "notion":
             notion_response = runtime.notion_request({**payload, "model": requested_model})
@@ -648,6 +650,11 @@ def install(runtime: Any) -> None:
 
     runtime.app.add_api_route("/v1/chat/completions", chat_completions, methods=["POST"])
     runtime.app.add_api_route("/v1/responses", responses, methods=["POST"])
+    # LanAnh and older 9Router-style clients append `/chat/completions` to a
+    # bare gateway origin. Keep those clients working while `/v1/*` remains
+    # the canonical OpenAI-compatible surface.
+    runtime.app.add_api_route("/chat/completions", chat_completions, methods=["POST"], include_in_schema=False)
+    runtime.app.add_api_route("/responses", responses, methods=["POST"], include_in_schema=False)
 
 
 def _remove_route(runtime: Any, path: str) -> None:

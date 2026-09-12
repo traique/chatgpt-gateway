@@ -552,8 +552,13 @@ def _ensure_notion_table(connection: Any) -> None:
             "CREATE TABLE IF NOT EXISTS notion_accounts ("
             "id TEXT PRIMARY KEY, label TEXT NOT NULL, cookie_enc TEXT NOT NULL, "
             "user_id TEXT NOT NULL, space_id TEXT NOT NULL, space_name TEXT NOT NULL DEFAULT '', "
-            "status TEXT NOT NULL DEFAULT 'active', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)"
+            "user_agent_enc TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active', "
+            "created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)"
         )
+        # Existing deployments predate the browser user-agent column. Keeping
+        # the captured UA alongside the cookie prevents a browser session from
+        # being replayed with an invented, mismatched fingerprint after restart.
+        connection.execute("ALTER TABLE notion_accounts ADD COLUMN IF NOT EXISTS user_agent_enc TEXT NOT NULL DEFAULT ''")
         _notion_table_ready = True
 
 
@@ -566,7 +571,7 @@ def _active_notion_row(runtime: Any) -> dict[str, Any] | None:
     with runtime.db() as connection:
         _ensure_notion_table(connection)
         row = connection.execute(
-            "SELECT id, label, cookie_enc, user_id, space_id, space_name FROM notion_accounts "
+            "SELECT id, label, cookie_enc, user_id, space_id, space_name, user_agent_enc FROM notion_accounts "
             "WHERE status='active' ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
     if not row:
@@ -578,6 +583,7 @@ def _active_notion_row(runtime: Any) -> dict[str, Any] | None:
         "user_id": str(row[3]),
         "space_id": str(row[4]),
         "space_name": str(row[5] or ""),
+        "user_agent_enc": str(row[6] or ""),
     }
 
 
@@ -588,6 +594,9 @@ def get_active_notion_account(runtime: Any) -> dict[str, Any]:
     stored = row["cookie_enc"]
     if runtime.DATABASE_URL:
         stored = runtime.decrypt_token(stored)
+    stored_user_agent = str(row.get("user_agent_enc") or "")
+    if runtime.DATABASE_URL and stored_user_agent:
+        stored_user_agent = runtime.decrypt_token(stored_user_agent)
     # Backward compatible with rows that store either token_v2 only or a minimal browser session cookie.
     parsed = parse_browser_cookie(stored) if "=" in stored else {}
     token_v2 = normalize_token_v2(parsed.get("token_v2") or stored)
@@ -599,6 +608,7 @@ def get_active_notion_account(runtime: Any) -> dict[str, Any]:
         "device_id": parsed.get("device_id", ""),
         "user_id": row.get("user_id") or parsed.get("notion_user_id", ""),
         "notion_users": parsed.get("notion_users", ""),
+        "user_agent": stored_user_agent or DEFAULT_NOTION_USER_AGENT,
     }
 
 
@@ -610,6 +620,8 @@ def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> st
     # browser/device ids plus the resolved user id; browser login keeps the real values.
     stored_credential = session_cookie if session_cookie and "token_v2=" in session_cookie else build_cookie_header(account)
     encrypted = runtime.encrypt_token(stored_credential) if runtime.DATABASE_URL else stored_credential
+    user_agent = str(account.get("user_agent") or DEFAULT_NOTION_USER_AGENT)
+    encrypted_user_agent = runtime.encrypt_token(user_agent) if runtime.DATABASE_URL else user_agent
     now = int(time.time() * 1000)
     if not runtime.DATABASE_URL:
         for entry in _memory_notion_accounts.values():
@@ -622,6 +634,7 @@ def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> st
             "user_id": account["user_id"],
             "space_id": account["space_id"],
             "space_name": account.get("space_name", ""),
+            "user_agent_enc": encrypted_user_agent,
             "status": "active",
             "created_at": now,
             "updated_at": now,
@@ -634,9 +647,9 @@ def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> st
             (now,),
         )
         connection.execute(
-            "INSERT INTO notion_accounts (id, label, cookie_enc, user_id, space_id, space_name, status, created_at, updated_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,'active',%s,%s)",
-            (account_id, label, encrypted, account["user_id"], account["space_id"], account.get("space_name", ""), now, now),
+            "INSERT INTO notion_accounts (id, label, cookie_enc, user_id, space_id, space_name, user_agent_enc, status, created_at, updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)",
+            (account_id, label, encrypted, account["user_id"], account["space_id"], account.get("space_name", ""), encrypted_user_agent, now, now),
         )
     return account_id
 

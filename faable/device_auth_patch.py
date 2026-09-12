@@ -234,7 +234,48 @@ def upstream_response(runtime: Any, response: Any, requested_model: str | None =
 
 
 def install(runtime: Any) -> None:
-    _remove_routes(runtime, frozenset({"/auth/device/poll", "/v1/chat/completions", "/v1/responses", "/v1/models"}))
+    _remove_routes(runtime, frozenset({"/auth/device/start", "/auth/device/poll", "/v1/chat/completions", "/v1/responses", "/v1/models"}))
+
+    def device_start(request: Request) -> dict[str, Any]:
+        """Start browser/device authorization with actionable block-page errors."""
+        runtime.require_admin(request)
+        runtime.database_required()
+        try:
+            response = runtime.requests.post(
+                f"{runtime.CHATGPT_AUTH_BASE_URL}/api/accounts/deviceauth/usercode",
+                headers={**runtime.device_auth_headers(), "Accept": "application/json"},
+                json={"client_id": runtime.CHATGPT_OAUTH_CLIENT_ID},
+                impersonate="chrome120",
+                timeout=30,
+            )
+        except Exception as error:
+            raise HTTPException(status_code=502, detail=f"ChatGPT device login transport failed: {error}") from error
+        if not response.ok:
+            state, message = classify_device_auth_response(response)
+            detail = message or f"Device login initialization failed: HTTP {response.status_code}."
+            raise HTTPException(status_code=502 if state == "failed" else response.status_code, detail=detail)
+        try:
+            payload = parse_json_payload(response)
+        except ValueError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        device_auth_id = payload.get("device_auth_id")
+        user_code = payload.get("user_code") or payload.get("usercode")
+        if not isinstance(device_auth_id, str) or not device_auth_id or not isinstance(user_code, str) or not user_code:
+            raise HTTPException(status_code=502, detail="Device login returned an invalid JSON payload.")
+        try:
+            interval = max(int(payload.get("interval", 5)), 3)
+        except (TypeError, ValueError):
+            interval = 5
+        now = int(time.time() * 1000)
+        session_id = str(uuid.uuid4())
+        expires_at = now + 15 * 60 * 1000
+        with runtime.db() as connection:
+            connection.execute(
+                "INSERT INTO device_login_sessions (id, device_auth_id, user_code, interval_seconds, expires_at, status, created_at, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,'pending',%s,%s)",
+                (session_id, device_auth_id, user_code, interval, expires_at, now, now),
+            )
+        return {"login_id": session_id, "user_code": user_code, "interval_seconds": interval, "expires_at": expires_at, "verification_url": runtime.DEVICE_VERIFICATION_URL}
 
     def device_poll(request: Request, payload: dict[str, Any]) -> dict[str, str]:
         runtime.require_admin(request)
@@ -383,6 +424,7 @@ def install(runtime: Any) -> None:
     runtime.build_chat_completions_payload = build_chat_completions_payload
     runtime.aggregate_chat_completion = aggregate_chat_completion
     runtime.upstream_response = lambda response: upstream_response(runtime, response)
+    runtime.app.add_api_route("/auth/device/start", device_start, methods=["POST"])
     runtime.app.add_api_route("/auth/device/poll", device_poll, methods=["POST"])
     runtime.app.add_api_route("/v1/responses", responses, methods=["POST"])
     runtime.app.add_api_route("/v1/chat/completions", chat_completions, methods=["POST"])

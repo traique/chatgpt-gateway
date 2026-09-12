@@ -63,6 +63,12 @@ NIM_PUBLIC_CATALOG: tuple[str, ...] = (
     "mistralai/mistral-large-2-instruct",
     "google/gemma-3-27b-it",
 )
+PROVIDER_FALLBACK_CATALOGS: dict[str, tuple[str, ...]] = {
+    PROVIDER_OPENROUTER: OPENROUTER_PUBLIC_CATALOG,
+    PROVIDER_TOKENROUTER: TOKENROUTER_PUBLIC_CATALOG,
+    PROVIDER_NOTION: NOTION_PUBLIC_CATALOG,
+    PROVIDER_NIM: NIM_PUBLIC_CATALOG,
+}
 MODELS_CACHE_TTL_SECONDS = 60
 
 _models_cache: dict[str, Any] = {"ts": 0.0, "models": []}
@@ -172,8 +178,16 @@ def resolve_model(runtime: Any, requested: Any, default: str) -> str:
     """Return the model the client asked for, unless it is empty/an alias —
     then fall back to the client's model, the admin's global pick, or the default."""
     model = str(requested or "").strip()
+    policy = get_client_policy()
+    effective_provider = policy.get("provider") if policy and policy.get("provider") else get_active_provider(runtime)
+    # Clients commonly retain a generic default such as `gpt-4o-mini` when
+    # pointed at a new base URL. It is not a Codex backend model, so forwarding
+    # it makes the ChatGPT route fail. Treat unknown ids as aliases only for
+    # the ChatGPT provider; third-party providers retain their own catalogs.
+    if effective_provider == PROVIDER_CHATGPT and model and model not in DEFAULT_MODEL_ALIASES and model not in CHATGPT_ADMIN_MODELS:
+        active = get_active_model(runtime)
+        return active or default
     if model in DEFAULT_MODEL_ALIASES:
-        policy = get_client_policy()
         if policy and policy.get("model"):
             return policy["model"]
         active = get_active_model(runtime)
@@ -211,7 +225,35 @@ def resolve_provider_model(runtime: Any, provider: str, requested: Any) -> str:
         return active
     if catalog:
         return catalog[0]
-    return model
+    fallback = PROVIDER_FALLBACK_CATALOGS.get(provider, ())
+    if fallback:
+        return fallback[0]
+    # B.AI has no trustworthy public catalog. Do not silently send a model id
+    # copied from another client (for example ZCode's GLM default) to it.
+    if provider == PROVIDER_BAI:
+        raise HTTPException(
+            status_code=503,
+            detail="B.AI model catalog is unavailable. Select a B.AI model in /admin before sending requests.",
+        )
+    raise HTTPException(status_code=503, detail=f"No usable model is configured for provider {provider}.")
+
+
+def sanitize_chat_payload(provider: str, payload: dict[str, Any], model: str) -> dict[str, Any]:
+    """Remove client-library envelopes that OpenAI-compatible upstreams reject.
+
+    ZCode and a few SDKs put provider options in ``extra_body``. That field is
+    not part of the Chat Completions schema and notably causes NIM to reject an
+    otherwise valid request. Keep standard OpenAI fields intact and apply only
+    the small provider-specific compatibility filter needed by strict APIs.
+    """
+    sanitized = dict(payload)
+    sanitized.pop("extra_body", None)
+    sanitized.pop("extra_headers", None)
+    if provider == PROVIDER_NIM:
+        for field in ("reasoning_effort", "service_tier", "verbosity", "store"):
+            sanitized.pop(field, None)
+    sanitized["model"] = model
+    return sanitized
 
 
 def _ensure_client_table(connection: Any) -> None:
@@ -419,6 +461,7 @@ def install(runtime: Any) -> None:
     runtime.bai_configured = lambda: bai_configured(runtime)
     runtime.resolve_model = lambda requested, default: resolve_model(runtime, requested, default)
     runtime.resolve_provider_model = lambda provider, requested: resolve_provider_model(runtime, provider, requested)
+    runtime.sanitize_chat_payload = lambda provider, payload, model: sanitize_chat_payload(provider, payload, model)
     runtime.bai_request = lambda path, **kwargs: bai_request(runtime, path, **kwargs)
     runtime.bai_list_models = lambda: bai_list_models(runtime)
     runtime.lookup_client_policy = lambda supplied: _lookup_client_policy(runtime, supplied)
@@ -446,7 +489,8 @@ def install(runtime: Any) -> None:
     ) -> dict[str, Any]:
         runtime.authorize(authorization, x_api_key)
         created = int(time.time())
-        active = get_active_provider(runtime)
+        policy = get_client_policy()
+        active = policy["provider"] if policy and policy.get("provider") else get_active_provider(runtime)
         if active == PROVIDER_BAI:
             catalog = bai_list_models(runtime)
             owned_by = "b-ai"
@@ -562,6 +606,7 @@ def install(runtime: Any) -> None:
         return {"ok": True, "active_provider": get_active_provider(runtime), "active_model": get_active_model(runtime)}
 
     runtime.app.add_api_route("/v1/models", models_endpoint, methods=["GET"])
+    runtime.app.add_api_route("/models", models_endpoint, methods=["GET"], include_in_schema=False)
     runtime.app.add_api_route("/auth/providers", providers, methods=["GET"])
     runtime.app.add_api_route("/auth/providers/{provider}/models", provider_models, methods=["GET"])
     runtime.app.add_api_route("/auth/providers/select", select_provider, methods=["POST"])
