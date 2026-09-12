@@ -60,5 +60,42 @@ create index if not exists gateway_api_keys_hash_idx
 
 alter table public.gateway_api_keys enable row level security;
 
+
+create table if not exists public.notion_accounts (
+    id text primary key,
+    label text not null,
+    cookie_enc text not null,
+    user_id text not null,
+    space_id text not null,
+    space_name text not null default '',
+    status text not null default 'active',
+    created_at bigint not null,
+    updated_at bigint not null
+);
+
+create index if not exists notion_accounts_status_idx
+    on public.notion_accounts (status);
+
+alter table public.notion_accounts enable row level security;
+
+create table if not exists public.notion_browser_login_sessions (
+    id text primary key,
+    label text not null,
+    status text not null default 'pending',
+    error text not null default '',
+    account_id text not null default '',
+    expires_at bigint not null,
+    created_at bigint not null,
+    updated_at bigint not null
+);
+
+create index if not exists notion_browser_login_sessions_status_idx
+    on public.notion_browser_login_sessions (status);
+
+create index if not exists notion_browser_login_sessions_expires_at_idx
+    on public.notion_browser_login_sessions (expires_at);
+
+alter table public.notion_browser_login_sessions enable row level security;
+
 alter table public.chatgpt_accounts enable row level security;
 alter table public.device_login_sessions enable row level security;
