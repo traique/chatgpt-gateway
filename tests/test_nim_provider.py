@@ -83,6 +83,31 @@ def test_chat_completions_passthrough_non_stream(monkeypatch) -> None:
     assert captured["json"]["model"] == "meta/llama-3.3-70b-instruct"
 
 
+def test_nim_strips_zcode_client_envelopes(monkeypatch) -> None:
+    _activate_nim()
+    runtime.NIM_API_KEY = "nvapi-test"
+    captured: dict = {}
+
+    def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"id": "cmpl-nim", "object": "chat.completion"}
+        return response
+
+    monkeypatch.setattr(runtime.requests, "post", fake_post)
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer test-gateway-key"},
+        json={"model": "chatgpt-gpt-5.6", "messages": [{"role": "user", "content": "hi"}], "extra_body": {"chat_template_kwargs": {"enable_thinking": True}}, "reasoning_effort": "high", "store": True},
+    )
+
+    assert response.status_code == 200
+    assert "extra_body" not in captured["json"]
+    assert "reasoning_effort" not in captured["json"]
+    assert "store" not in captured["json"]
+
+
 def test_chat_completions_passthrough_stream(monkeypatch) -> None:
     _activate_nim()
     runtime.NIM_API_KEY = "nvapi-test"

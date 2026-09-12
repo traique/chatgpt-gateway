@@ -52,6 +52,12 @@ def test_faable_runtime_uses_patched_device_poll_route() -> None:
     assert routes[0].endpoint.__module__ == "faable.device_auth_patch"
 
 
+def test_faable_runtime_uses_patched_device_start_route() -> None:
+    routes = [route for route in runtime.app.routes if getattr(route, "path", None) == "/auth/device/start" and "POST" in getattr(route, "methods", set())]
+    assert len(routes) == 1
+    assert routes[0].endpoint.__module__ == "faable.device_auth_patch"
+
+
 def test_chat_completions_payload_maps_public_gpt_5_6_alias_to_codex_terra() -> None:
     payload = {"model": "chatgpt-gpt-5.6", "messages": [{"role": "user", "content": "Hello"}]}
     upstream = runtime.build_chat_completions_payload(payload)

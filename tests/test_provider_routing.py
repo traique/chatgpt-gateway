@@ -52,6 +52,11 @@ def test_resolve_model_without_active_model_keeps_requested() -> None:
     assert resolve_model(runtime, "chatgpt-gpt-5.6", "chatgpt-gpt-5.6") == "chatgpt-gpt-5.6"
 
 
+def test_chatgpt_replaces_generic_client_default_with_gateway_model() -> None:
+    runtime.set_active_provider_model("chatgpt", "gpt-5.6-terra")
+    assert resolve_model(runtime, "gpt-4o-mini", "chatgpt-gpt-5.6") == "gpt-5.6-terra"
+
+
 def test_providers_endpoint_lists_providers(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "require_admin", lambda request: None)
     client = TestClient(app)
@@ -109,6 +114,26 @@ def test_chat_completions_bai_non_stream_passthrough(monkeypatch) -> None:
     assert captured["url"] == "https://api.b.ai/v1/chat/completions"
     assert captured["json"]["model"] == "deepseek-v4-flash"
     assert captured["headers"]["Authorization"] == "Bearer sk-bai"
+
+
+def test_unversioned_chat_alias_supports_router9_style_clients(monkeypatch) -> None:
+    _activate_bai("deepseek-v4-flash")
+    monkeypatch.setattr(runtime, "BAI_API_KEY", "sk-bai")
+
+    def fake_post(url, **kwargs):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"id": "cmpl-1", "object": "chat.completion"}
+        return response
+
+    monkeypatch.setattr(runtime.requests, "post", fake_post)
+    response = TestClient(app).post(
+        "/chat/completions",
+        headers={"Authorization": "Bearer test-gateway-key"},
+        json={"model": "chatgpt-gpt-5.6", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
 
 
 def test_chat_completions_bai_stream_passthrough(monkeypatch) -> None:
@@ -181,6 +206,22 @@ def test_v1_models_chatgpt_provider_unchanged() -> None:
     data = response.json()["data"]
     assert data[0]["id"] == "chatgpt-gpt-5.6"
     assert data[0]["owned_by"] == "openai-chatgpt"
+
+
+def test_v1_models_uses_client_key_provider(monkeypatch) -> None:
+    client = _admin_client(monkeypatch)
+    key = client.post(
+        "/auth/clients",
+        json={"label": "nim-client", "provider": "nim", "model": "deepseek-ai/deepseek-r1"},
+    ).json()["key"]
+    monkeypatch.setattr(runtime, "NIM_API_KEY", "nvapi-test")
+    monkeypatch.setattr(runtime, "nim_list_models", lambda: ["deepseek-ai/deepseek-r1"])
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    assert response.json()["data"][0]["owned_by"] == "nvidia-nim"
+    assert response.json()["data"][0]["id"] == "deepseek-ai/deepseek-r1"
 
 
 def test_v1_messages_bai_native_passthrough(monkeypatch) -> None:

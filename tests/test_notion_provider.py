@@ -528,3 +528,19 @@ def test_save_manual_notion_account_persists_stable_minimal_session() -> None:
     assert "notion_browser_id=browser-1" in active["full_cookie"]
     assert "device_id=device-1" in active["full_cookie"]
     assert "notion_user_id=user-1" in active["full_cookie"]
+
+
+def test_save_notion_account_preserves_browser_user_agent() -> None:
+    account = {
+        "token_v2": NOTION_TOKEN_V2,
+        "full_cookie": "token_v2=tok123; notion_user_id=user-1",
+        "user_id": "user-1",
+        "space_id": "space-1",
+        "space_name": "Workspace",
+        "user_agent": "Mozilla/5.0 Chrome/133.0.0.0 Safari/537.36",
+    }
+
+    notion_provider.save_notion_account(runtime, "Notion", account)
+    active = notion_provider.get_active_notion_account(runtime)
+
+    assert active["user_agent"] == account["user_agent"]
