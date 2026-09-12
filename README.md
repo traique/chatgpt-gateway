@@ -1,6 +1,5 @@
 # ChatGPT Gateway
 
-
 FastAPI gateway chạy trên **Faable**, kết nối ChatGPT/Codex upstream bằng `curl-cffi` và lưu account/session data trên **Supabase PostgreSQL**.
 
 > ChatGPT/Codex authentication và backend endpoint là private/internal interfaces và có thể thay đổi. Gateway không phải OpenAI Public API.
@@ -11,7 +10,7 @@ FastAPI gateway chạy trên **Faable**, kết nối ChatGPT/Codex upstream bằ
 Client
   ↓
 Faable / FastAPI
-  ├── /auth
+  ├── /admin  (khuyến nghị; /auth vẫn tương thích)
   ├── /v1/models
   ├── /v1/debug/transport
   ├── /v1/chat/completions  (OpenAI-compatible, hỗ trợ tool calling)
@@ -59,6 +58,8 @@ Tùy chọn cho các provider khác (có thể dán key trực tiếp trong admi
 BAI_API_KEY          # API key của B.AI (https://api.b.ai)
 BAI_BASE_URL         # mặc định https://api.b.ai/v1
 OPENROUTER_API_KEY   # API key OpenRouter (https://openrouter.ai)
+TOKENROUTER_API_KEY  # API key TokenRouter (tr_...)
+TOKENROUTER_BASE_URL # mặc định https://api.tokenrouter.io/v1
 NIM_API_KEY          # API key NVIDIA NIM (https://build.nvidia.com)
 ```
 
@@ -138,11 +139,15 @@ Endpoint này trả trạng thái cấu hình runtime, transport và database co
 
 ## Admin
 
-Mở:
+Mở trang quản trị bằng đường dẫn khuyến nghị:
 
 ```text
-/auth
+/admin
 ```
+
+`/auth` vẫn được giữ để tương thích. Khi mở `/admin`, frontend dùng các alias `/admin-api/*` thay cho `/auth/*`; chức năng và quyền truy cập giống nhau.
+
+Trang admin ưu tiên hiển thị nhanh: endpoint provider ban đầu chỉ đọc trạng thái local/DB và catalog fallback/cache, không chờ API model của provider. Catalog động của **provider đang chọn** mới được tải nền sau khi UI đã hiện; timeout discovery được giới hạn để upstream chậm không làm dashboard treo.
 
 Đăng nhập bằng:
 
@@ -152,6 +157,12 @@ ADMIN_PASSWORD
 ```
 
 Session admin có TTL 12 giờ và sử dụng HttpOnly cookie.
+
+### FortiGuard / enterprise web filter
+
+Nếu `/auth` bị FortiGuard chặn nhưng domain là hợp lệ, thử truy cập `/admin` trước để loại trừ false-positive theo URL path. Gateway cũng trả `Cache-Control: no-store`, CSP, anti-clickjacking và referrer/security headers cho trang quản trị.
+
+Nếu **cả domain** vẫn bị chặn, đây không phải vấn đề có thể sửa chắc chắn bằng code ứng dụng. Kiểm tra rating của hostname trên FortiGuard Web Filter và gửi yêu cầu phân loại lại nếu bị `Not Rated/Unrated` hoặc phân loại sai. Trong mạng doanh nghiệp, quản trị FortiGate có thể tạo exception cho đúng hostname theo policy nội bộ; không nên tắt toàn bộ IPS/Web Filter chỉ để chạy gateway.
 
 ## ChatGPT device login
 
@@ -262,45 +273,52 @@ Nó chỉ kiểm tra transport/network; HTTP 200 từ `robots.txt` không có ng
 
 ## Providers
 
-Gateway hỗ trợ nhiều provider upstream, chọn trong trang admin (`/auth`) tại thẻ **Provider & Model**:
+Gateway hỗ trợ nhiều provider upstream, chọn trong trang admin (`/admin`, hoặc `/auth` tương thích) tại thẻ **Provider & Model**:
 
 | Provider | Endpoint | Xác thực | Ghi chú |
 | --- | --- | --- | --- |
 | `chatgpt` | ChatGPT/Codex backend (mặc định) | Device login | Đầy đủ tool calling, usage |
 | `bai` | `https://api.b.ai/v1` (OpenAI/Anthropic/Responses compatible) | `BAI_API_KEY` | Passthrough native cả 3 protocol |
 | `openrouter` | `https://openrouter.ai/api/v1` (OpenAI-compatible) | Key dán trong admin (hoặc `OPENROUTER_API_KEY`) | Model list động, lọc sẵn model free (đuôi `:free`) |
+| `tokenrouter` | `https://api.tokenrouter.io/v1` (OpenAI-compatible) | Key dán trong admin (hoặc `TOKENROUTER_API_KEY`) | Model list động; hỗ trợ Chat Completions, Responses và Anthropic Messages |
 | `notion` | `https://app.notion.com/api/v3` (runInferenceTranscript) | Browser-assisted hoặc `token_v2` | Model list động từ `getAvailableModels` theo workspace |
 | `nim` | `https://integrate.api.nvidia.com/v1` (OpenAI-compatible) | Key dán trong admin (hoặc `NIM_API_KEY`) | Model list động, lọc model không chat-capable (NIM là free tier) |
 
-Cấu hình OpenRouter / Notion / NIM ngay trên trang admin:
+Cấu hình OpenRouter / TokenRouter / Notion / NIM ngay trên trang admin:
 
 - **OpenRouter**: dán API key (`sk-or-v1-…`) vào thẻ *OpenRouter*. Danh sách model lấy từ OpenRouter và lọc chỉ giữ model free (`:free`); đặt `OPENROUTER_MODELS_FILTER_MODE=all` để xem toàn bộ catalog.
-- **Notion AI**: có 2 cách đăng nhập. **Browser-assisted** mở một Chrome/Edge tạm trên **chính máy đang chạy gateway**, bạn đăng nhập Notion bình thường và gateway tự đọc riêng cookie `token_v2` qua Chrome DevTools rồi đóng profile tạm. Cách này phù hợp khi chạy gateway trên máy desktop có GUI; VPS/Docker không có display sẽ báo không hỗ trợ. **Token thủ công** vẫn cho phép dán riêng `token_v2`. Cả hai cách đều chỉ lưu `token_v2` đã mã hóa, không lưu mật khẩu hay toàn bộ cookie.
+- **TokenRouter**: dán key (`tr_…`) vào thẻ *TokenRouter*. Gateway dùng base mặc định `https://api.tokenrouter.io/v1`; có thể đổi bằng `TOKENROUTER_BASE_URL`. Catalog model lấy động từ `/v1/models` và cache 5 phút.
+- **Notion AI**: có 2 cách đăng nhập. **Browser-assisted** mở một Chrome/Edge tạm trên **chính máy đang chạy gateway**, bạn đăng nhập Notion bình thường và gateway tự lấy session tối thiểu qua Chrome DevTools (`token_v2`, `notion_user_id`, `notion_users`, cùng browser/device id nếu Notion cấp), rồi đóng profile tạm. Cách này được ưu tiên vì Notion có thể trả 401 khi session identity không khớp. **Session thủ công** cho phép nhập `token_v2` (bắt buộc), `notion_user_id` và `notion_users` từ cùng một phiên browser; gateway dùng `notion_user_id` làm active-user header và giữ nguyên `notion_users` nếu được cung cấp. Nếu `notion_users` bỏ trống nhưng có `notion_user_id`, gateway chỉ dựng giá trị fallback để giữ tương thích. Mật khẩu không được thu thập, dữ liệu session được mã hóa trước khi lưu.
 - **NVIDIA NIM**: dán key (`nvapi-…`) vào thẻ *NVIDIA NIM*. Catalog lấy trực tiếp từ NVIDIA (cache 5 phút) và lọc bỏ model embedding/rerank/OCR…; `NIM_MODELS_FILTER_MODE=all` để tắt lọc, `NIM_FREE_EXCLUDE=từ-khóa` để loại thêm.
 
-Với B.AI / OpenRouter / Notion / NIM, model do client gửi được đối chiếu với catalog của provider đang hoạt động: khớp thì giữ nguyên; nếu client hardcode một model không tồn tại (VD ZCode luôn gửi `glm-5.3-flash`), gateway tự thay bằng model admin đã chọn cho provider đó, hoặc model đầu tiên trong catalog — client không cần đổi cấu hình khi đổi provider. Model hợp lệ luôn được chuyển nguyên bản.
+Với B.AI / OpenRouter / TokenRouter / Notion / NIM, model do client gửi được đối chiếu với catalog của provider đang hoạt động: khớp thì giữ nguyên; nếu client hardcode một model không tồn tại (VD ZCode luôn gửi `glm-5.3-flash`), gateway tự thay bằng model admin đã chọn cho provider đó, hoặc model đầu tiên trong catalog — client không cần đổi cấu hình khi đổi provider. Model hợp lệ luôn được chuyển nguyên bản.
 
-Provider secrets được mã hóa Fernet khi lưu DB. OpenRouter/NIM dùng `gateway_settings`; Notion lưu riêng `token_v2` đã mã hóa trong `notion_accounts`. API admin liên quan:
+Provider secrets được mã hóa Fernet khi lưu DB. OpenRouter/TokenRouter/NIM dùng `gateway_settings`; Notion lưu session tối thiểu đã mã hóa trong `notion_accounts`. API admin liên quan:
 
 ```text
 POST /auth/openrouter/key      # {"api_key": "sk-or-v1-…"}
 GET  /auth/openrouter/key      # {"configured": true}
+POST /auth/tokenrouter/key     # {"api_key": "tr_…"}
+GET  /auth/tokenrouter/key     # {"configured": true, "base_url": "..."}
 POST /auth/nim/key             # {"api_key": "nvapi-…"}
-GET  /auth/nim/key             # {"configured": true, "models": [...]}
-POST /auth/notion/login          # {"token_v2": "..."}
+GET  /auth/nim/key             # {"configured": true}; catalog model tải lazy
+POST /auth/notion/login          # {"token_v2": "...", "notion_user_id": "...", "notion_users": "..."}
 POST /auth/notion/browser/start  # mở Chrome/Edge local và bắt đầu chờ login
 POST /auth/notion/browser/poll   # {"login_id": "..."}
 GET  /auth/notion/accounts       # danh sách tài khoản Notion
 DELETE /auth/notion/accounts/{id}
 ```
 
-OpenRouter và NIM nói chuẩn OpenAI nên `/v1/chat/completions` được passthrough nguyên bản (stream + non-stream, kể cả tool calling). Hai provider này không hỗ trợ `/v1/responses`; khi được chọn, endpoint đó trả 503 kèm hướng dẫn. Notion không có tool calling native — các message được gộp thành một prompt duy nhất và văn bản trả về được chuyển thành `chat.completion` chuẩn (stream qua bộ parse NDJSON của Notion).
+OpenRouter, TokenRouter và NIM nói chuẩn OpenAI nên `/v1/chat/completions` được passthrough nguyên bản (stream + non-stream, kể cả tool calling). TokenRouter cũng được passthrough native cho `/v1/responses` và `/v1/messages`; OpenRouter và NIM hiện vẫn trả 503 ở endpoint Responses. Notion không có tool calling native — các message được gộp thành một prompt duy nhất và văn bản trả về được chuyển thành `chat.completion` chuẩn (stream qua bộ parse NDJSON của Notion).
 
 API admin:
 
 ```text
-GET  /auth/providers           # liệt kê provider, model và trạng thái đang chọn
-POST /auth/providers/select    # {"provider": "chatgpt"|"bai"|"openrouter"|"notion"|"nim", "model": "..."}
+GET  /auth/providers                    # bootstrap nhanh, không gọi upstream model
+GET  /auth/providers/{provider}/models  # tải catalog động của một provider khi cần
+POST /auth/providers/select             # {"provider": "chatgpt"|"bai"|"openrouter"|"tokenrouter"|"notion"|"nim", "model": "..."}
+
+# Khi dùng /admin, các API trên có alias tương ứng dưới /admin-api/*.
 ```
 
 Lựa chọn được lưu trong bảng `gateway_settings` (hoặc trong bộ nhớ nếu không có `DATABASE_URL`). Khi client gọi model mặc định (`chatgpt-gpt-5.6` hoặc bỏ trống), gateway dùng model admin đã chọn cho provider đang active; model client ghi rõ thì được truyền nguyên. `/v1/models` trả về danh sách model của provider đang active (B.AI được query trực tiếp từ `GET /v1/models` của B.AI với cache 60 giây).
