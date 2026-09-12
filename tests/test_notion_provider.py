@@ -54,8 +54,10 @@ def _notion_stream_lines() -> list[bytes]:
 def _signin_notion(monkeypatch) -> TestClient:
     monkeypatch.setattr(runtime, "require_admin", lambda request: None)
 
-    def fake_bootstrap(runtime_arg, token_v2):
+    def fake_bootstrap(runtime_arg, token_v2, **kwargs):
         assert token_v2 == NOTION_TOKEN_V2
+        assert kwargs.get("user_id", "") == ""
+        assert kwargs.get("notion_users", "") == ""
         return {
             "token_v2": NOTION_TOKEN_V2,
             "full_cookie": f"token_v2={token_v2}",
@@ -80,7 +82,6 @@ def _signin_notion(monkeypatch) -> TestClient:
 def _activate_notion() -> None:
     runtime.set_active_provider_model("notion", "notion-ai")
 
-
 def test_login_requires_token_v2(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "require_admin", lambda request: None)
     client = TestClient(app)
@@ -89,7 +90,6 @@ def test_login_requires_token_v2(monkeypatch) -> None:
 
     assert response.status_code == 400
     assert "token_v2" in response.json()["detail"]
-
 
 def test_login_rejects_full_cookie_string(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "require_admin", lambda request: None)
@@ -103,6 +103,64 @@ def test_login_rejects_full_cookie_string(monkeypatch) -> None:
     assert response.status_code == 400
     assert "only the token_v2 value" in response.json()["detail"]
 
+def test_manual_login_forwards_notion_identity_cookies(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "require_admin", lambda request: None)
+    captured: dict[str, str] = {}
+
+    def fake_bootstrap(runtime_arg, token_v2, **kwargs):
+        captured["token_v2"] = token_v2
+        captured["user_id"] = kwargs.get("user_id", "")
+        captured["notion_users"] = kwargs.get("notion_users", "")
+        return {
+            "token_v2": token_v2,
+            "user_id": captured["user_id"],
+            "notion_users": captured["notion_users"],
+            "user_name": "Gia",
+            "user_email": "g@example.com",
+            "space_id": "space-1",
+            "space_name": "Workspace",
+            "space_view_id": "view-1",
+            "browser_id": "browser-1",
+            "device_id": "device-1",
+        }
+
+    monkeypatch.setattr(notion_provider, "bootstrap_notion_account", fake_bootstrap)
+    client = TestClient(app)
+    response = client.post(
+        "/auth/notion/login",
+        json={
+            "token_v2": "token_v2=tok123",
+            "notion_user_id": "notion_user_id=user-1",
+            "notion_users": "notion_users=[%22user-1%22]",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "token_v2": "tok123",
+        "user_id": "user-1",
+        "notion_users": "[%22user-1%22]",
+    }
+    active = notion_provider.get_active_notion_account(runtime)
+    assert active["user_id"] == "user-1"
+    assert active["notion_users"] == "[%22user-1%22]"
+    assert "notion_user_id=user-1" in active["full_cookie"]
+    assert "notion_users=[%22user-1%22]" in active["full_cookie"]
+
+def test_manual_login_rejects_full_cookie_in_identity_fields(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "require_admin", lambda request: None)
+    client = TestClient(app)
+
+    response = client.post(
+        "/auth/notion/login",
+        json={
+            "token_v2": NOTION_TOKEN_V2,
+            "notion_user_id": "user-1; notion_users=[%22user-1%22]",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "only the notion_user_id value" in response.json()["detail"]
 
 def test_obsolete_bookmarklet_routes_are_removed(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "require_admin", lambda request: None)
@@ -110,7 +168,6 @@ def test_obsolete_bookmarklet_routes_are_removed(monkeypatch) -> None:
 
     assert client.post("/auth/notion/start").status_code == 404
     assert client.get("/auth/notion/capture?t=anything").status_code == 404
-
 
 def test_browser_login_routes(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "require_admin", lambda request: None)
@@ -141,14 +198,12 @@ def test_browser_login_routes(monkeypatch) -> None:
     assert polled.json()["status"] == "completed"
     assert polled.json()["account_id"] == "acc-1"
 
-
 def test_browser_login_poll_requires_id(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "require_admin", lambda request: None)
     client = TestClient(app)
     response = client.post("/auth/notion/browser/poll", json={})
     assert response.status_code == 400
     assert "login_id" in response.json()["detail"]
-
 
 def test_notion_login_and_accounts(monkeypatch) -> None:
     client = _signin_notion(monkeypatch)
@@ -158,7 +213,6 @@ def test_notion_login_and_accounts(monkeypatch) -> None:
     assert accounts[0]["status"] == "active"
     assert accounts[0]["space_id"] == "space-1"
     assert notion_provider.notion_configured(runtime) is True
-
 
 def test_notion_chat_completions_non_stream(monkeypatch) -> None:
     _signin_notion(monkeypatch)
@@ -200,7 +254,6 @@ def test_notion_chat_completions_non_stream(monkeypatch) -> None:
     assert user_entry["type"] == "user"
     assert user_entry["value"] == [["hi"]]
 
-
 def test_notion_route_forwards_resolved_model(monkeypatch) -> None:
     _signin_notion(monkeypatch)
     _activate_notion()
@@ -226,7 +279,6 @@ def test_notion_route_forwards_resolved_model(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert captured["model"] == "opus-4.8"
-
 
 def test_notion_chat_completions_stream_sse(monkeypatch) -> None:
     _signin_notion(monkeypatch)
@@ -262,7 +314,6 @@ def test_notion_chat_completions_stream_sse(monkeypatch) -> None:
     finish = [chunk for chunk in deltas if chunk["choices"][0]["finish_reason"] == "stop"]
     assert finish and finish[0]["usage"]["total_tokens"] == 12
 
-
 def test_notion_chat_without_account_returns_503(monkeypatch) -> None:
     _activate_notion()
     client = TestClient(app)
@@ -275,7 +326,6 @@ def test_notion_chat_without_account_returns_503(monkeypatch) -> None:
 
     assert response.status_code == 503
     assert "Notion" in response.json()["detail"]
-
 
 def test_notion_error_event_maps_to_http_error(monkeypatch) -> None:
     _signin_notion(monkeypatch)
@@ -300,7 +350,6 @@ def test_notion_error_event_maps_to_http_error(monkeypatch) -> None:
     assert response.status_code == 502
     assert "boom" in response.json()["detail"]
 
-
 def test_notion_responses_endpoint_unsupported(monkeypatch) -> None:
     _signin_notion(monkeypatch)
     _activate_notion()
@@ -315,12 +364,10 @@ def test_notion_responses_endpoint_unsupported(monkeypatch) -> None:
     assert response.status_code == 503
     assert "/v1/chat/completions" in response.json()["detail"]
 
-
 def test_notion_model_aliases_resolve() -> None:
     assert notion_provider.resolve_notion_model("opus-4.8") == "ambrosia-tart-high"
     assert notion_provider.resolve_notion_model("") == notion_provider.DEFAULT_NOTION_MODEL
     assert notion_provider.resolve_notion_model("fireworks-kimi-k2.6") == "fireworks-kimi-k2.6"
-
 
 def test_parse_available_models_builds_alias_map_and_catalog() -> None:
     payload = {
@@ -337,7 +384,6 @@ def test_parse_available_models_builds_alias_map_and_catalog() -> None:
     assert alias_map["sonnet-5"] == "angel-cake-high"
     assert "Old Model" not in catalog
     assert catalog == ["Opus 4.8", "Sonnet 5"]
-
 
 def test_notion_list_models_uses_get_available_models(monkeypatch) -> None:
     notion_provider._memory_notion_accounts["acc-1"] = {
@@ -364,3 +410,121 @@ def test_notion_list_models_uses_get_available_models(monkeypatch) -> None:
     assert captured["url"] == "https://app.notion.com/api/v3/getAvailableModels"
     assert captured["json"] == {"spaceId": "space-1"}
     assert notion_provider.resolve_notion_model("gpt-5.6-terra") == "orchid-muffin"
+
+def test_build_cookie_header_preserves_exact_notion_users_value() -> None:
+    header = notion_provider.build_cookie_header({
+        "token_v2": NOTION_TOKEN_V2,
+        "user_id": "user-1",
+        "notion_users": "%5B%22user-1%22%2C%22user-2%22%5D",
+        "browser_id": "browser-1",
+        "device_id": "device-1",
+    })
+
+    assert "notion_user_id=user-1" in header
+    assert "notion_users=%5B%22user-1%22%2C%22user-2%22%5D" in header
+    assert "token_v2=tok123" in header
+
+def test_bootstrap_manual_identity_fields_are_sent_on_first_request(monkeypatch) -> None:
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs["headers"]
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = _bootstrap_payload()
+        response.text = ""
+        return response
+
+    monkeypatch.setattr(runtime.requests, "post", fake_post)
+    account = notion_provider.bootstrap_notion_account(
+        runtime,
+        NOTION_TOKEN_V2,
+        user_id="user-1",
+        notion_users="%5B%22user-1%22%5D",
+        browser_id="browser-1",
+        device_id="device-1",
+    )
+
+    assert account["user_id"] == "user-1"
+    assert account["notion_users"] == "%5B%22user-1%22%5D"
+    assert captured["url"] == "https://app.notion.com/api/v3/loadUserContent"
+    assert captured["headers"]["x-notion-active-user-header"] == "user-1"
+    assert "notion_user_id=user-1" in captured["headers"]["cookie"]
+    assert "notion_users=%5B%22user-1%22%5D" in captured["headers"]["cookie"]
+
+def test_bootstrap_401_falls_back_to_www_and_uses_browser_session(monkeypatch) -> None:
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        response = Mock()
+        if url.startswith("https://app.notion.com"):
+            response.status_code = 401
+            response.text = "unauthorized"
+            return response
+        response.status_code = 200
+        response.json.return_value = _bootstrap_payload()
+        response.text = ""
+        return response
+
+    monkeypatch.setattr(runtime.requests, "post", fake_post)
+    account = notion_provider.bootstrap_notion_account(
+        runtime,
+        NOTION_TOKEN_V2,
+        session_cookie=(
+            "notion_browser_id=browser-real; device_id=device-real; "
+            "notion_user_id=user-1; notion_users=[%22user-1%22]; token_v2=tok123"
+        ),
+        user_id="user-1",
+        browser_id="browser-real",
+        device_id="device-real",
+    )
+
+    assert account["user_id"] == "user-1"
+    assert account["space_id"] == "space-1"
+    assert [url for url, _ in calls] == [
+        "https://app.notion.com/api/v3/loadUserContent",
+        "https://www.notion.so/api/v3/loadUserContent",
+    ]
+    first_headers = calls[0][1]["headers"]
+    assert "token_v2=tok123" in first_headers["cookie"]
+    assert "notion_browser_id=browser-real" in first_headers["cookie"]
+    assert first_headers["x-notion-active-user-header"] == "user-1"
+
+def test_bootstrap_401_message_does_not_claim_token_is_expired(monkeypatch) -> None:
+    def fake_post(url, **kwargs):
+        response = Mock()
+        response.status_code = 401
+        response.text = "unauthorized"
+        return response
+
+    monkeypatch.setattr(runtime.requests, "post", fake_post)
+
+    with pytest.raises(Exception) as error:
+        notion_provider.bootstrap_notion_account(runtime, NOTION_TOKEN_V2)
+
+    detail = getattr(error.value, "detail", str(error.value))
+    assert "does not always mean token_v2 expired" in detail
+    assert "Browser Login" in detail
+    assert "notion_user_id" in detail
+    assert "notion_users" in detail
+
+def test_save_manual_notion_account_persists_stable_minimal_session() -> None:
+    account = {
+        "token_v2": NOTION_TOKEN_V2,
+        "full_cookie": "",
+        "user_id": "user-1",
+        "space_id": "space-1",
+        "space_name": "Workspace",
+        "browser_id": "browser-1",
+        "device_id": "device-1",
+    }
+
+    notion_provider.save_notion_account(runtime, "Notion", account)
+    active = notion_provider.get_active_notion_account(runtime)
+
+    assert active["token_v2"] == NOTION_TOKEN_V2
+    assert "notion_browser_id=browser-1" in active["full_cookie"]
+    assert "device_id=device-1" in active["full_cookie"]
+    assert "notion_user_id=user-1" in active["full_cookie"]

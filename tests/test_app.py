@@ -73,3 +73,12 @@ def test_extract_account_id_from_organization_claim() -> None:
 
 def test_extract_account_id_rejects_invalid_token() -> None:
     assert extract_account_id("not-a-jwt") is None
+
+
+def test_admin_alias_is_html_with_security_headers() -> None:
+    response = client.get('/admin')
+    assert response.status_code == 200
+    assert 'Đăng nhập ChatGPT' in response.text
+    assert response.headers['cache-control'].startswith('no-store')
+    assert response.headers['x-frame-options'] == 'DENY'
+    assert "frame-ancestors 'none'" in response.headers['content-security-policy']

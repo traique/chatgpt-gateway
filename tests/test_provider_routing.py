@@ -61,7 +61,7 @@ def test_providers_endpoint_lists_providers(monkeypatch) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["active_provider"] == "chatgpt"
-    assert [p["id"] for p in body["providers"]] == ["chatgpt", "bai", "openrouter", "notion", "nim"]
+    assert [p["id"] for p in body["providers"]] == ["chatgpt", "bai", "openrouter", "tokenrouter", "notion", "nim"]
     chatgpt = body["providers"][0]
     assert chatgpt["configured"] is True
     assert "chatgpt-gpt-5.6" in chatgpt["models"]
@@ -388,3 +388,56 @@ def test_client_policy_without_model_falls_back_to_global_model(monkeypatch) -> 
 
     # Client policy without a model falls back to the admin's global model pick.
     assert resolve_model(runtime, "chatgpt-gpt-5.6", "chatgpt-gpt-5.6") == "global-model"
+
+
+def test_providers_endpoint_does_not_fetch_remote_catalogs(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, 'require_admin', lambda request: None)
+    monkeypatch.setattr(runtime, 'BAI_API_KEY', 'sk-bai')
+    monkeypatch.setattr(runtime, 'openrouter_configured', lambda: True)
+    monkeypatch.setattr(runtime, 'tokenrouter_configured', lambda: True)
+    monkeypatch.setattr(runtime, 'notion_configured', lambda: True)
+    monkeypatch.setattr(runtime, 'nim_configured', lambda: True)
+    monkeypatch.setattr(runtime, 'openrouter_list_models', lambda: (_ for _ in ()).throw(AssertionError('remote OpenRouter fetch')))
+    monkeypatch.setattr(runtime, 'tokenrouter_list_models', lambda: (_ for _ in ()).throw(AssertionError('remote TokenRouter fetch')))
+    monkeypatch.setattr(runtime, 'notion_list_models', lambda: (_ for _ in ()).throw(AssertionError('remote Notion fetch')))
+    monkeypatch.setattr(runtime, 'nim_list_models', lambda: (_ for _ in ()).throw(AssertionError('remote NIM fetch')))
+
+    response = TestClient(app).get('/auth/providers')
+
+    assert response.status_code == 200
+    assert response.json()['active_provider'] == 'chatgpt'
+
+
+def test_provider_models_endpoint_fetches_only_requested_provider(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, 'require_admin', lambda request: None)
+    monkeypatch.setattr(runtime, 'openrouter_configured', lambda: True)
+    monkeypatch.setattr(runtime, 'openrouter_list_models', lambda: ['vendor/model-a', 'vendor/model-b'])
+    monkeypatch.setattr(runtime, 'tokenrouter_list_models', lambda: (_ for _ in ()).throw(AssertionError('wrong provider fetched')))
+
+    response = TestClient(app).get('/auth/providers/openrouter/models')
+
+    assert response.status_code == 200
+    assert response.json()['models'] == ['vendor/model-a', 'vendor/model-b']
+    assert response.json()['source'] == 'live'
+
+
+def test_admin_api_aliases_auth_routes(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, 'require_admin', lambda request: None)
+    response = TestClient(app).get('/admin-api/providers')
+    assert response.status_code == 200
+    assert response.json()['active_provider'] == 'chatgpt'
+
+
+def test_admin_api_aliases_keep_all_methods() -> None:
+    route_methods = {
+        (getattr(route, 'path', ''), tuple(sorted(getattr(route, 'methods', None) or ())))
+        for route in app.router.routes
+    }
+    assert ('/admin-api/clients', ('GET',)) in route_methods
+    assert ('/admin-api/clients', ('POST',)) in route_methods
+    assert ('/admin-api/openrouter/key', ('GET',)) in route_methods
+    assert ('/admin-api/openrouter/key', ('POST',)) in route_methods
+    assert ('/admin-api/tokenrouter/key', ('GET',)) in route_methods
+    assert ('/admin-api/tokenrouter/key', ('POST',)) in route_methods
+    assert ('/admin-api/nim/key', ('GET',)) in route_methods
+    assert ('/admin-api/nim/key', ('POST',)) in route_methods

@@ -73,7 +73,7 @@ def test_chat_completions_passthrough_non_stream(monkeypatch) -> None:
     assert response.json()["id"] == "cmpl-or"
     assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer sk-or-v1-test"
-    assert captured["json"]["model"] == "openai/gpt-5.6"
+    assert captured["json"]["model"] == "openrouter/auto"
 
 
 def test_chat_completions_passthrough_stream(monkeypatch) -> None:
@@ -182,7 +182,7 @@ def test_providers_endpoint_lists_all_providers(monkeypatch) -> None:
 
     assert response.status_code == 200
     ids = [p["id"] for p in response.json()["providers"]]
-    assert ids == ["chatgpt", "bai", "openrouter", "notion", "nim"]
+    assert ids == ["chatgpt", "bai", "openrouter", "tokenrouter", "notion", "nim"]
 
 
 def test_client_key_can_target_openrouter(monkeypatch) -> None:
