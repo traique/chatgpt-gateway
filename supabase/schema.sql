@@ -68,10 +68,14 @@ create table if not exists public.notion_accounts (
     user_id text not null,
     space_id text not null,
     space_name text not null default '',
+    user_agent_enc text not null default '',
     status text not null default 'active',
     created_at bigint not null,
     updated_at bigint not null
 );
+
+alter table public.notion_accounts
+    add column if not exists user_agent_enc text not null default '';
 
 create index if not exists notion_accounts_status_idx
     on public.notion_accounts (status);
