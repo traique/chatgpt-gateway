@@ -1,27 +1,25 @@
-"""Notion AI provider: browser-cookie login (token_v2) + runInferenceTranscript.
+"""Notion AI provider: browser-assisted/token_v2 login + runInferenceTranscript.
 
-Login flow mirrors the ChatGPT device-login UX: the admin opens notion.com,
-signs in normally, then clicks the "→ Gateway" bookmarklet on that tab; the
-gateway receives the browser cookie, resolves user/space info via Notion's
-loadUserContent endpoint and stores the cookie encrypted in the database.
-Manual cookie paste is still supported as a fallback. Chat requests are
-translated to Notion's runInferenceTranscript NDJSON endpoint and streamed
-back as OpenAI SSE chunks.
+Admins can either paste a ``token_v2`` value or use a local browser-assisted
+flow that opens an isolated Chrome/Edge profile on the gateway machine and
+extracts only ``token_v2`` after a normal Notion sign-in. The gateway resolves
+user/workspace metadata via loadUserContent and stores only the token encrypted.
 """
 from __future__ import annotations
 
 import json
 import re
-import secrets
+import threading
 import time
 import uuid
 from typing import Any
 
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
+
+from .notion_browser_auth import browser_login_capability, capture_token_v2
 
 NOTION_API_BASE = "https://app.notion.com/api/v3"
-NOTION_LOGIN_URL = "https://www.notion.com/login"
 NOTION_IMPERSONATE = "chrome131"
 DEFAULT_NOTION_CLIENT_VERSION = "23.13.20260710.0022"
 DEFAULT_NOTION_USER_AGENT = (
@@ -77,10 +75,9 @@ _NOTION_XML_INCOMPLETE_RE = re.compile(r"<(?:lang|mention|source)\s[^>]*$", re.M
 NOTION_MODELS_CACHE_TTL_SECONDS = 300
 
 _memory_notion_accounts: dict[str, dict[str, Any]] = {}
+_memory_notion_browser_logins: dict[str, dict[str, Any]] = {}
 _notion_table_ready = False
-_memory_notion_login_tokens: dict[str, int] = {}
-_notion_login_table_ready = False
-NOTION_LOGIN_TOKEN_TTL_MS = 15 * 60 * 1000
+_notion_browser_login_table_ready = False
 _notion_models_cache: dict[str, Any] = {"ts": 0.0, "alias_map": {}, "models": []}
 
 
@@ -216,18 +213,27 @@ def notion_request_headers(account: dict[str, Any], *, accept: str = "applicatio
     }
 
 
-def bootstrap_notion_account(runtime: Any, cookie: str) -> dict[str, Any]:
-    """Resolve user/space info from a pasted browser cookie via loadUserContent."""
-    parsed = parse_browser_cookie(cookie)
-    token_v2 = parsed.get("token_v2")
-    if not token_v2:
-        raise HTTPException(status_code=400, detail="Cookie string is missing token_v2.")
+def normalize_token_v2(value: str) -> str:
+    """Normalize a token_v2 value while rejecting a pasted full cookie string."""
+    token = str(value or "").strip()
+    if token.startswith("token_v2="):
+        token = token[len("token_v2="):].strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="token_v2 is required.")
+    if ";" in token:
+        raise HTTPException(status_code=400, detail="Paste only the token_v2 value, not the full Notion cookie string.")
+    return token
+
+
+def bootstrap_notion_account(runtime: Any, token_v2: str) -> dict[str, Any]:
+    """Resolve user/space info from a token_v2 session value via loadUserContent."""
+    token_v2 = normalize_token_v2(token_v2)
     account: dict[str, Any] = {
         "token_v2": token_v2,
-        "full_cookie": cookie.strip().rstrip(";"),
-        "user_id": parsed.get("notion_user_id") or "",
-        "browser_id": parsed.get("notion_browser_id") or str(uuid.uuid4()),
-        "device_id": parsed.get("device_id") or str(uuid.uuid4()),
+        "full_cookie": f"token_v2={token_v2}",
+        "user_id": "",
+        "browser_id": str(uuid.uuid4()),
+        "device_id": str(uuid.uuid4()),
         "timezone": NOTION_DEFAULT_TIMEZONE,
     }
     headers = notion_request_headers(account, accept="application/json")
@@ -243,11 +249,11 @@ def bootstrap_notion_account(runtime: Any, cookie: str) -> dict[str, Any]:
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"Notion transport failed: {error}") from error
     if response.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"loadUserContent failed (HTTP {response.status_code}). Cookie may be expired.")
+        raise HTTPException(status_code=502, detail=f"loadUserContent failed (HTTP {response.status_code}). token_v2 may be expired.")
     record_map = (response.json() or {}).get("recordMap") or {}
     user_id = account["user_id"] or next(iter(record_map.get("notion_user") or {}), "")
     if not user_id:
-        raise HTTPException(status_code=502, detail="Could not determine Notion user_id from the cookie.")
+        raise HTTPException(status_code=502, detail="Could not determine Notion user_id from token_v2.")
     account["user_id"] = user_id
     user_entry = ((record_map.get("notion_user") or {}).get(user_id) or {}).get("value") or {}
     user_value = user_entry.get("value") or user_entry
@@ -271,7 +277,7 @@ def bootstrap_notion_account(runtime: Any, cookie: str) -> dict[str, Any]:
             space_view_id = str(value.get("id") or "")
             break
     if not space_id:
-        raise HTTPException(status_code=502, detail="No Notion workspace found for this cookie.")
+        raise HTTPException(status_code=502, detail="No Notion workspace found for token_v2.")
     account["space_id"] = space_id
     account["space_name"] = space_name
     account["space_view_id"] = space_view_id
@@ -285,6 +291,119 @@ def notion_configured(runtime: Any) -> bool:
         return False
 
 
+def _ensure_notion_browser_login_table(connection: Any) -> None:
+    global _notion_browser_login_table_ready
+    if not _notion_browser_login_table_ready:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS notion_browser_login_sessions ("
+            "id TEXT PRIMARY KEY, label TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', "
+            "error TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', "
+            "expires_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)"
+        )
+        _notion_browser_login_table_ready = True
+
+
+def _create_notion_browser_login(runtime: Any, label: str, timeout_seconds: int = 300) -> dict[str, Any]:
+    now = int(time.time() * 1000)
+    login_id = str(uuid.uuid4())
+    row = {
+        "id": login_id,
+        "label": label,
+        "status": "pending",
+        "error": "",
+        "account_id": "",
+        "expires_at": now + timeout_seconds * 1000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if not runtime.DATABASE_URL:
+        _memory_notion_browser_logins[login_id] = row
+        return dict(row)
+    with runtime.db() as connection:
+        _ensure_notion_browser_login_table(connection)
+        connection.execute(
+            "INSERT INTO notion_browser_login_sessions "
+            "(id,label,status,error,account_id,expires_at,created_at,updated_at) "
+            "VALUES (%s,%s,'pending','','',%s,%s,%s)",
+            (login_id, label, row["expires_at"], now, now),
+        )
+    return dict(row)
+
+
+def _update_notion_browser_login(runtime: Any, login_id: str, *, status: str, error: str = "", account_id: str = "") -> None:
+    now = int(time.time() * 1000)
+    if not runtime.DATABASE_URL:
+        row = _memory_notion_browser_logins.get(login_id)
+        if row:
+            row.update({"status": status, "error": error[:1000], "account_id": account_id, "updated_at": now})
+        return
+    with runtime.db() as connection:
+        _ensure_notion_browser_login_table(connection)
+        connection.execute(
+            "UPDATE notion_browser_login_sessions SET status=%s,error=%s,account_id=%s,updated_at=%s WHERE id=%s",
+            (status, error[:1000], account_id, now, login_id),
+        )
+
+
+def _get_notion_browser_login(runtime: Any, login_id: str) -> dict[str, Any] | None:
+    if not runtime.DATABASE_URL:
+        row = _memory_notion_browser_logins.get(login_id)
+        return dict(row) if row else None
+    with runtime.db() as connection:
+        _ensure_notion_browser_login_table(connection)
+        row = connection.execute(
+            "SELECT id,label,status,error,account_id,expires_at,created_at,updated_at "
+            "FROM notion_browser_login_sessions WHERE id=%s",
+            (login_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": str(row[0]), "label": str(row[1]), "status": str(row[2]),
+        "error": str(row[3] or ""), "account_id": str(row[4] or ""),
+        "expires_at": int(row[5]), "created_at": int(row[6]), "updated_at": int(row[7]),
+    }
+
+
+def _run_notion_browser_login(runtime: Any, login_id: str, label: str, timeout_seconds: int = 300) -> None:
+    try:
+        _update_notion_browser_login(runtime, login_id, status="browser_open")
+        token_v2 = capture_token_v2(timeout_seconds=timeout_seconds)
+        account = bootstrap_notion_account(runtime, token_v2)
+        account_id = save_notion_account(runtime, label, account)
+        _update_notion_browser_login(runtime, login_id, status="completed", account_id=account_id)
+    except TimeoutError as error:
+        _update_notion_browser_login(runtime, login_id, status="expired", error=str(error))
+    except Exception as error:
+        _update_notion_browser_login(runtime, login_id, status="failed", error=str(error))
+
+
+def start_notion_browser_login(runtime: Any, label: str, timeout_seconds: int = 300) -> dict[str, Any]:
+    capable, reason = browser_login_capability()
+    if not capable:
+        raise HTTPException(status_code=503, detail=reason + " Bạn vẫn có thể đăng nhập bằng token_v2.")
+    row = _create_notion_browser_login(runtime, label, timeout_seconds=timeout_seconds)
+    thread = threading.Thread(
+        target=_run_notion_browser_login,
+        args=(runtime, row["id"], label, timeout_seconds),
+        name=f"notion-login-{row['id'][:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return row
+
+
+def poll_notion_browser_login(runtime: Any, login_id: str) -> dict[str, Any]:
+    row = _get_notion_browser_login(runtime, login_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Notion browser login session not found.")
+    now = int(time.time() * 1000)
+    if row["status"] in {"pending", "browser_open"} and int(row["expires_at"]) <= now:
+        _update_notion_browser_login(runtime, login_id, status="expired", error="Hết thời gian chờ đăng nhập Notion.")
+        row = _get_notion_browser_login(runtime, login_id) or row
+    return row
+
+
 def _ensure_notion_table(connection: Any) -> None:
     global _notion_table_ready
     if not _notion_table_ready:
@@ -295,47 +414,6 @@ def _ensure_notion_table(connection: Any) -> None:
             "status TEXT NOT NULL DEFAULT 'active', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)"
         )
         _notion_table_ready = True
-
-
-def _ensure_notion_login_table(connection: Any) -> None:
-    global _notion_login_table_ready
-    if not _notion_login_table_ready:
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS notion_login_tokens ("
-            "token TEXT PRIMARY KEY, created_at BIGINT NOT NULL)"
-        )
-        _notion_login_table_ready = True
-
-
-def _create_notion_login_token(runtime: Any) -> str:
-    token = secrets.token_urlsafe(24)
-    now = int(time.time() * 1000)
-    if not runtime.DATABASE_URL:
-        for created in [k for k, v in _memory_notion_login_tokens.items() if now - v > NOTION_LOGIN_TOKEN_TTL_MS]:
-            _memory_notion_login_tokens.pop(created, None)
-        _memory_notion_login_tokens[token] = now
-        return token
-    with runtime.db() as connection:
-        _ensure_notion_login_table(connection)
-        connection.execute("DELETE FROM notion_login_tokens WHERE created_at < %s", (now - NOTION_LOGIN_TOKEN_TTL_MS,))
-        connection.execute("INSERT INTO notion_login_tokens (token, created_at) VALUES (%s,%s)", (token, now))
-    return token
-
-
-def _consume_notion_login_token(runtime: Any, token: str) -> bool:
-    if not token:
-        return False
-    now = int(time.time() * 1000)
-    if not runtime.DATABASE_URL:
-        created = _memory_notion_login_tokens.pop(token, None)
-        return created is not None and now - created <= NOTION_LOGIN_TOKEN_TTL_MS
-    with runtime.db() as connection:
-        _ensure_notion_login_table(connection)
-        row = connection.execute("SELECT created_at FROM notion_login_tokens WHERE token=%s", (token,)).fetchone()
-        if not row:
-            return False
-        connection.execute("DELETE FROM notion_login_tokens WHERE token=%s", (token,))
-    return now - int(row[0]) <= NOTION_LOGIN_TOKEN_TTL_MS
 
 
 def _active_notion_row(runtime: Any) -> dict[str, Any] | None:
@@ -365,14 +443,20 @@ def _active_notion_row(runtime: Any) -> dict[str, Any] | None:
 def get_active_notion_account(runtime: Any) -> dict[str, Any]:
     row = _active_notion_row(runtime)
     if not row:
-        raise HTTPException(status_code=503, detail="No active Notion account. Open /auth and sign in with a Notion cookie first.")
-    cookie = runtime.decrypt_token(row["cookie_enc"]) if runtime.DATABASE_URL else row["cookie_enc"]
-    return {**row, "full_cookie": cookie, "token_v2": parse_browser_cookie(cookie).get("token_v2", "")}
+        raise HTTPException(status_code=503, detail="No active Notion account. Open /auth and add token_v2 first.")
+    stored = row["cookie_enc"]
+    if runtime.DATABASE_URL:
+        stored = runtime.decrypt_token(stored)
+    # Backward compatible with older rows that stored the complete cookie string.
+    token_v2 = parse_browser_cookie(stored).get("token_v2") if "=" in stored else stored
+    token_v2 = normalize_token_v2(token_v2 or "")
+    return {**row, "full_cookie": f"token_v2={token_v2}", "token_v2": token_v2}
 
 
 def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> str:
     account_id = str(uuid.uuid4())
-    encrypted = runtime.encrypt_token(account["full_cookie"])
+    token_v2 = normalize_token_v2(str(account.get("token_v2") or ""))
+    encrypted = runtime.encrypt_token(token_v2) if runtime.DATABASE_URL else token_v2
     now = int(time.time() * 1000)
     if not runtime.DATABASE_URL:
         for entry in _memory_notion_accounts.values():
@@ -920,13 +1004,8 @@ def aggregate_notion_chat(response: Any, requested_model: str) -> dict[str, Any]
     return completion
 
 
-NOTION_CAPTURE_HTML = """<!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Notion &rarr; Gateway</title><style>:root{font-family:system-ui,-apple-system,sans-serif;color:#111827;background:#f3f4f6}*{box-sizing:border-box}body{margin:0;padding:18px}.app{max-width:560px;margin:auto}.card{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 4px 16px #0000000a}h1{margin:0 0 8px;font-size:22px}.muted{font-size:14px;color:#6b7280;line-height:1.6}button{min-height:48px;border:0;border-radius:12px;background:#111827;color:#fff;font:inherit;font-weight:650;padding:12px;margin-top:14px;width:100%}.hidden{display:none}</style></head><body><main class='app'><section class='card'><h1>Notion &rarr; Gateway</h1><div id='msg' class='muted'>Đang nhận cookie từ tab Notion…</div><button id='back' class='hidden' onclick="location.href='/auth'">Quay lại trang quản trị</button></section></main><script>(async()=>{const m=document.getElementById('msg'),b=document.getElementById('back');const done=t=>{m.textContent=t;b.classList.remove('hidden')};let c='';try{c=decodeURIComponent(location.hash.slice(1))}catch(e){}history.replaceState(null,'',location.pathname+location.search);if(!c.toLowerCase().includes('token_v2='))return done('Không thấy cookie Notion (token_v2). Hãy đăng nhập notion.com rồi nhấn bookmark → Gateway ngay trên tab đó.');try{const r=await fetch('/auth/notion/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cookie:c,label:'Notion (web)'})});const d=await r.json().catch(()=>({}));if(r.ok)done('✓ Đã đăng nhập Notion thành công'+(d.data&&d.data[0]&&d.data[0].space_name?' — workspace: '+d.data[0].space_name:'')+'. Bạn có thể đóng trang này.');else done('Lỗi: '+(d.detail||('HTTP '+r.status))+(r.status===401?' — phiên quản trị hết hạn, hãy mở /auth, đăng nhập rồi thử lại từ đầu.':''))}catch(e){done('Lỗi: '+e.message)}})()</script></body></html>"""
-
-NOTION_CAPTURE_INVALID_HTML = """<!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Notion &rarr; Gateway</title><style>:root{font-family:system-ui,-apple-system,sans-serif;color:#111827;background:#f3f4f6}*{box-sizing:border-box}body{margin:0;padding:18px}.app{max-width:560px;margin:auto}.card{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 4px 16px #0000000a}h1{margin:0 0 8px;font-size:22px}.muted{font-size:14px;color:#6b7280;line-height:1.6}a{color:#111827}</style></head><body><main class='app'><section class='card'><h1>Notion &rarr; Gateway</h1><div class='muted'>Liên kết đăng nhập đã hết hạn hoặc đã được dùng. Hãy mở <a href='/auth'>trang quản trị</a>, nhấn “Đăng nhập Notion” lần nữa rồi lặp lại các bước.</div></section></main></body></html>"""
-
-
 def install(runtime: Any) -> None:
-    runtime.notion_bootstrap = lambda cookie: bootstrap_notion_account(runtime, cookie)
+    runtime.notion_bootstrap = lambda token_v2: bootstrap_notion_account(runtime, token_v2)
     runtime.notion_configured = lambda: notion_configured(runtime)
     runtime.notion_request = lambda payload: notion_inference_request(runtime, payload)
     runtime.resolve_notion_model = resolve_notion_model
@@ -934,13 +1013,37 @@ def install(runtime: Any) -> None:
 
     def notion_login(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
         runtime.require_admin(request)
-        cookie = str(payload.get("cookie") or "").strip()
-        if not cookie:
-            raise HTTPException(status_code=400, detail="cookie is required.")
+        token_v2 = normalize_token_v2(str(payload.get("token_v2") or ""))
         label = str(payload.get("label") or "").strip()[:100] or f"Notion {time.strftime('%Y-%m-%d %H:%M')}"
-        account = bootstrap_notion_account(runtime, cookie)
+        account = bootstrap_notion_account(runtime, token_v2)
         account_id = save_notion_account(runtime, label, account)
         return {"ok": True, "id": account_id, "data": notion_account_rows(runtime)}
+
+    def notion_browser_start(request: Request, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        runtime.require_admin(request)
+        payload = payload or {}
+        label = str(payload.get("label") or "").strip()[:100] or f"Notion {time.strftime('%Y-%m-%d %H:%M')}"
+        login = start_notion_browser_login(runtime, label)
+        return {
+            "login_id": login["id"],
+            "status": login["status"],
+            "expires_at": login["expires_at"],
+            "interval_seconds": 2,
+        }
+
+    def notion_browser_poll(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        runtime.require_admin(request)
+        login_id = str(payload.get("login_id") or "").strip()
+        if not login_id:
+            raise HTTPException(status_code=400, detail="login_id is required.")
+        login = poll_notion_browser_login(runtime, login_id)
+        return {
+            "login_id": login["id"],
+            "status": login["status"],
+            "error": login["error"],
+            "account_id": login["account_id"],
+            "expires_at": login["expires_at"],
+        }
 
     def notion_accounts(request: Request) -> dict[str, Any]:
         runtime.require_admin(request)
@@ -951,18 +1054,8 @@ def install(runtime: Any) -> None:
         disable_notion_account(runtime, account_id)
         return {"ok": True, "data": notion_account_rows(runtime)}
 
-    def notion_start(request: Request) -> dict[str, Any]:
-        runtime.require_admin(request)
-        return {"token": _create_notion_login_token(runtime), "login_url": NOTION_LOGIN_URL}
-
-    def notion_capture(request: Request) -> HTMLResponse:
-        token = str(request.query_params.get("t") or "")
-        if not _consume_notion_login_token(runtime, token):
-            return HTMLResponse(NOTION_CAPTURE_INVALID_HTML, status_code=400)
-        return HTMLResponse(NOTION_CAPTURE_HTML)
-
-    runtime.app.add_api_route("/auth/notion/start", notion_start, methods=["POST"])
-    runtime.app.add_api_route("/auth/notion/capture", notion_capture, methods=["GET"])
     runtime.app.add_api_route("/auth/notion/login", notion_login, methods=["POST"])
+    runtime.app.add_api_route("/auth/notion/browser/start", notion_browser_start, methods=["POST"])
+    runtime.app.add_api_route("/auth/notion/browser/poll", notion_browser_poll, methods=["POST"])
     runtime.app.add_api_route("/auth/notion/accounts", notion_accounts, methods=["GET"])
     runtime.app.add_api_route("/auth/notion/accounts/{account_id}", notion_disable, methods=["DELETE"])

@@ -586,7 +586,7 @@ def install(runtime: Any) -> None:
             response = requester("/chat/completions", json_payload={**payload, "model": requested_model}, stream=bool(payload.get("stream", False)))
             return _passthrough_response(response, bool(payload.get("stream", False)), provider_label)
         if active == "notion":
-            notion_response = runtime.notion_request(payload)
+            notion_response = runtime.notion_request({**payload, "model": requested_model})
             if bool(payload.get("stream", False)):
                 return StreamingResponse(
                     iter_notion_chat_stream(notion_response, requested_model),
