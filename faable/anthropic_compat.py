@@ -728,11 +728,52 @@ def _bai_messages_passthrough(runtime: Any, payload: dict[str, Any], requested_m
         return _anthropic_error_response("api_error", "B.AI returned a non-JSON response.", 502)
 
 
+
+def _tokenrouter_messages_passthrough(runtime: Any, payload: dict[str, Any], requested_model: str) -> Any:
+    """TokenRouter natively speaks Anthropic Messages; preserve the wire format."""
+    provider_resolver = getattr(runtime, "resolve_provider_model", None)
+    effective_model = provider_resolver("tokenrouter", requested_model) if provider_resolver else requested_model
+    try:
+        response = runtime.tokenrouter_request(
+            "/messages",
+            json_payload={**payload, "model": effective_model},
+            stream=bool(payload.get("stream", False)),
+            timeout=120,
+        )
+    except HTTPException as error:
+        return _anthropic_error_response("api_error", str(error.detail), error.status_code or 502)
+    except Exception as error:
+        return _anthropic_error_response("api_error", f"TokenRouter transport failed: {error}", 502)
+    if response.status_code >= 400:
+        detail = _read_upstream_error(response)
+        try:
+            response.close()
+        except Exception:
+            pass
+        return _anthropic_error_response(
+            _http_error_type(response.status_code),
+            f"TokenRouter HTTP {response.status_code}: {detail}",
+            response.status_code,
+        )
+    if bool(payload.get("stream", False)):
+        return StreamingResponse(
+            response.iter_content(chunk_size=4096),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+    try:
+        return JSONResponse(response.json())
+    except (TypeError, ValueError):
+        return _anthropic_error_response("api_error", "TokenRouter returned a non-JSON response.", 502)
+
 def _native_messages_passthrough(runtime: Any, payload: dict[str, Any], requested_model: str, *, provider: str) -> Any:
     """Route an Anthropic Messages request to OpenRouter/NIM by converting
     Anthropic format to their OpenAI-native /chat/completions and back."""
-    requester = runtime.openrouter_request if provider == "openrouter" else runtime.nim_request
-    provider_label = "OpenRouter" if provider == "openrouter" else "NVIDIA NIM"
+    requesters = {
+        "openrouter": (runtime.openrouter_request, "OpenRouter"),
+        "nim": (runtime.nim_request, "NVIDIA NIM"),
+    }
+    requester, provider_label = requesters[provider]
     provider_resolver = getattr(runtime, "resolve_provider_model", None)
     if provider_resolver is not None:
         effective_model = provider_resolver(provider, requested_model)
@@ -787,6 +828,8 @@ def install(runtime: Any) -> None:
             active = _active_provider(runtime)
             if active == "bai":
                 return _bai_messages_passthrough(runtime, payload, requested_model)
+            if active == "tokenrouter":
+                return _tokenrouter_messages_passthrough(runtime, payload, requested_model)
             if active in ("openrouter", "nim"):
                 return _native_messages_passthrough(runtime, payload, requested_model, provider=active)
             if active == "notion":

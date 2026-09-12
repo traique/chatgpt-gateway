@@ -87,7 +87,7 @@ def openrouter_list_models(runtime: Any) -> list[str]:
         response = runtime.requests.get(
             f"{runtime.OPENROUTER_BASE_URL}/models",
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
+            timeout=6,
         )
         payload = response.json()
     except Exception:

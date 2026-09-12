@@ -2,8 +2,9 @@
 
 This helper launches an isolated Chrome/Edge profile on the same machine that
 runs the gateway, waits for the user to finish a normal Notion sign-in, then
-reads only the ``token_v2`` cookie through the local Chrome DevTools Protocol.
-It never receives or stores the user's Notion password.
+reads the small set of Notion session cookies needed by the private web API through
+the local Chrome DevTools Protocol. It never receives or stores the user's Notion
+password.
 """
 from __future__ import annotations
 
@@ -130,27 +131,74 @@ def _browser_websocket_url(port: int, timeout_seconds: float = 15.0) -> str:
     raise RuntimeError(f"Chrome DevTools không khởi động được{detail}")
 
 
-def _read_token_v2(websocket_url: str) -> str:
+_SESSION_COOKIE_NAMES = (
+    "notion_browser_id",
+    "device_id",
+    "notion_user_id",
+    "notion_users",
+    "notion_check_cookie_consent",
+    "notion_locale",
+    "token_v2",
+)
+
+
+def _notion_domain_rank(domain: str) -> int:
+    domain = domain.lower().lstrip(".")
+    if domain.endswith("notion.com"):
+        return 20 + (2 if domain.startswith("app.") else 1)
+    if domain.endswith("notion.so"):
+        return 10
+    return 0
+
+
+def _read_notion_session(websocket_url: str) -> dict[str, str]:
+    """Read only the Notion cookies used by the private web API plus browser UA."""
     client = _CDP(websocket_url)
     try:
         result = client.call("Storage.getCookies")
         cookies = result.get("cookies") or []
+        chosen: dict[str, tuple[int, float, str]] = {}
         for cookie in cookies:
-            if not isinstance(cookie, dict) or cookie.get("name") != "token_v2":
+            if not isinstance(cookie, dict):
                 continue
-            domain = str(cookie.get("domain") or "").lower()
-            if "notion.com" not in domain and "notion.so" not in domain:
+            name = str(cookie.get("name") or "")
+            if name not in _SESSION_COOKIE_NAMES:
                 continue
+            domain = str(cookie.get("domain") or "")
+            rank = _notion_domain_rank(domain)
             value = str(cookie.get("value") or "").strip()
-            if value:
-                return value
-        return ""
+            if not rank or not value:
+                continue
+            try:
+                expires = float(cookie.get("expires") or 0)
+            except (TypeError, ValueError):
+                expires = 0.0
+            previous = chosen.get(name)
+            if previous is None or (rank, expires) > (previous[0], previous[1]):
+                chosen[name] = (rank, expires, value)
+        session = {name: chosen[name][2] for name in _SESSION_COOKIE_NAMES if name in chosen}
+        try:
+            version = client.call("Browser.getVersion")
+            user_agent = str(version.get("userAgent") or "").strip()
+            if user_agent:
+                session["user_agent"] = user_agent
+        except Exception:
+            pass
+        return session
     finally:
         client.close()
 
 
-def capture_token_v2(timeout_seconds: int = DEFAULT_LOGIN_TIMEOUT_SECONDS) -> str:
-    """Open a temporary browser window and return the Notion token_v2 cookie."""
+def _session_cookie_header(session: dict[str, str]) -> str:
+    return "; ".join(
+        f"{name}={session[name]}"
+        for name in _SESSION_COOKIE_NAMES
+        if session.get(name)
+    )
+
+
+def capture_notion_session(timeout_seconds: int = DEFAULT_LOGIN_TIMEOUT_SECONDS) -> dict[str, str]:
+    """Open a temporary browser and return the minimal authenticated Notion session."""
     capable, browser_or_reason = browser_login_capability()
     if not capable:
         raise RuntimeError(browser_or_reason)
@@ -176,9 +224,10 @@ def capture_token_v2(timeout_seconds: int = DEFAULT_LOGIN_TIMEOUT_SECONDS) -> st
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError("Cửa sổ đăng nhập Notion đã bị đóng trước khi đăng nhập hoàn tất.")
-            token = _read_token_v2(websocket_url)
-            if token:
-                return token
+            session = _read_notion_session(websocket_url)
+            if session.get("token_v2"):
+                session["cookie"] = _session_cookie_header(session)
+                return session
             time.sleep(2)
         raise TimeoutError("Hết thời gian chờ đăng nhập Notion.")
     finally:
@@ -191,3 +240,8 @@ def capture_token_v2(timeout_seconds: int = DEFAULT_LOGIN_TIMEOUT_SECONDS) -> st
             except Exception:
                 pass
         shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def capture_token_v2(timeout_seconds: int = DEFAULT_LOGIN_TIMEOUT_SECONDS) -> str:
+    """Backward-compatible helper that returns only token_v2."""
+    return capture_notion_session(timeout_seconds=timeout_seconds)["token_v2"]

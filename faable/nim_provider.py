@@ -90,7 +90,7 @@ def nim_list_models(runtime: Any) -> list[str]:
         response = runtime.requests.get(
             f"{runtime.NIM_BASE_URL}/models",
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
+            timeout=6,
         )
         payload = response.json()
     except Exception:
@@ -172,7 +172,9 @@ def install(runtime: Any) -> None:
 
     def key_status(request: Request) -> dict[str, Any]:
         runtime.require_admin(request)
-        return {"configured": nim_configured(runtime), "models": nim_list_models(runtime)}
+        # Keep /auth fast: model discovery is loaded lazily from the provider
+        # catalog endpoint instead of blocking this lightweight status call.
+        return {"configured": nim_configured(runtime)}
 
     runtime.app.add_api_route("/auth/nim/key", save_key, methods=["POST"])
     runtime.app.add_api_route("/auth/nim/key", key_status, methods=["GET"])

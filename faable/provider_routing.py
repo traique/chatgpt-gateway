@@ -14,9 +14,10 @@ from fastapi import Header, HTTPException, Request
 PROVIDER_CHATGPT = "chatgpt"
 PROVIDER_BAI = "bai"
 PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_TOKENROUTER = "tokenrouter"
 PROVIDER_NOTION = "notion"
 PROVIDER_NIM = "nim"
-KNOWN_PROVIDERS = (PROVIDER_CHATGPT, PROVIDER_BAI, PROVIDER_OPENROUTER, PROVIDER_NOTION, PROVIDER_NIM)
+KNOWN_PROVIDERS = (PROVIDER_CHATGPT, PROVIDER_BAI, PROVIDER_OPENROUTER, PROVIDER_TOKENROUTER, PROVIDER_NOTION, PROVIDER_NIM)
 DEFAULT_BAI_BASE_URL = "https://api.b.ai/v1"
 DEFAULT_MODEL_ALIASES = frozenset({"", "chatgpt-gpt-5.6", "gpt-5.6"})
 CHATGPT_ADMIN_MODELS = ("chatgpt-gpt-5.6", "gpt-5.6-terra", "gpt-5.6-codex")
@@ -24,6 +25,7 @@ PROVIDER_LABELS = {
     PROVIDER_CHATGPT: "ChatGPT / Codex",
     PROVIDER_BAI: "B.AI",
     PROVIDER_OPENROUTER: "OpenRouter",
+    PROVIDER_TOKENROUTER: "TokenRouter",
     PROVIDER_NOTION: "Notion AI",
     PROVIDER_NIM: "NVIDIA NIM",
 }
@@ -33,6 +35,15 @@ OPENROUTER_PUBLIC_CATALOG: tuple[str, ...] = (
     "meta-llama/llama-4-maverick:free",
     "qwen/qwen3-coder:free",
     "mistralai/mistral-small:free",
+)
+TOKENROUTER_PUBLIC_CATALOG: tuple[str, ...] = (
+    "auto",
+    "auto:balance",
+    "auto:cost",
+    "auto:quality",
+    "auto:latency",
+    "openai/gpt-5-mini",
+    "anthropic/claude-sonnet-4-5",
 )
 NOTION_PUBLIC_CATALOG: tuple[str, ...] = (
     "notion-ai",
@@ -182,6 +193,8 @@ def resolve_provider_model(runtime: Any, provider: str, requested: Any) -> str:
         catalog = bai_list_models(runtime)
     elif provider == PROVIDER_OPENROUTER:
         catalog = runtime.openrouter_list_models()
+    elif provider == PROVIDER_TOKENROUTER:
+        catalog = runtime.tokenrouter_list_models()
     elif provider == PROVIDER_NOTION:
         catalog = runtime.notion_list_models()
     elif provider == PROVIDER_NIM:
@@ -273,7 +286,7 @@ def bai_list_models(runtime: Any) -> list[str]:
             f"{runtime.BAI_BASE_URL}/models",
             headers={"Authorization": f"Bearer {runtime.BAI_API_KEY}"},
             impersonate="chrome120",
-            timeout=15,
+            timeout=6,
         )
         payload = response.json()
     except Exception:
@@ -416,9 +429,11 @@ def install(runtime: Any) -> None:
     from faable.nim_provider import install as install_nim_provider
     from faable.notion_provider import install as install_notion_provider
     from faable.openrouter_provider import install as install_openrouter_provider
+    from faable.tokenrouter_provider import install as install_tokenrouter_provider
 
     install_notion_provider(runtime)
     install_openrouter_provider(runtime)
+    install_tokenrouter_provider(runtime)
     install_nim_provider(runtime)
 
     runtime.app.router.routes[:] = [
@@ -438,6 +453,9 @@ def install(runtime: Any) -> None:
         elif active == PROVIDER_OPENROUTER:
             catalog = runtime.openrouter_list_models() or list(OPENROUTER_PUBLIC_CATALOG)
             owned_by = "openrouter"
+        elif active == PROVIDER_TOKENROUTER:
+            catalog = runtime.tokenrouter_list_models() or list(TOKENROUTER_PUBLIC_CATALOG)
+            owned_by = "tokenrouter"
         elif active == PROVIDER_NOTION:
             catalog = runtime.notion_list_models() or list(NOTION_PUBLIC_CATALOG)
             owned_by = "notion"
@@ -452,21 +470,86 @@ def install(runtime: Any) -> None:
             "data": [{"id": model_id, "object": "model", "created": created, "owned_by": owned_by} for model_id in catalog],
         }
 
+    def provider_configured(provider: str) -> bool:
+        if provider == PROVIDER_CHATGPT:
+            return True
+        if provider == PROVIDER_BAI:
+            return bai_configured(runtime)
+        if provider == PROVIDER_OPENROUTER:
+            return runtime.openrouter_configured()
+        if provider == PROVIDER_TOKENROUTER:
+            return runtime.tokenrouter_configured()
+        if provider == PROVIDER_NOTION:
+            return runtime.notion_configured()
+        if provider == PROVIDER_NIM:
+            return runtime.nim_configured()
+        return False
+
+    def fallback_models(provider: str) -> list[str]:
+        if provider == PROVIDER_CHATGPT:
+            return list(CHATGPT_ADMIN_MODELS)
+        if provider == PROVIDER_OPENROUTER:
+            return list(OPENROUTER_PUBLIC_CATALOG)
+        if provider == PROVIDER_TOKENROUTER:
+            return list(TOKENROUTER_PUBLIC_CATALOG)
+        if provider == PROVIDER_NOTION:
+            return list(NOTION_PUBLIC_CATALOG)
+        if provider == PROVIDER_NIM:
+            return list(NIM_PUBLIC_CATALOG)
+        if provider == PROVIDER_BAI:
+            # Never make a network request while rendering /auth. Reuse a warm
+            # cache when available; the UI fetches the live catalog lazily.
+            return list(_models_cache.get("models") or [])
+        return []
+
+    def live_models(provider: str) -> list[str]:
+        if provider == PROVIDER_CHATGPT:
+            return list(CHATGPT_ADMIN_MODELS)
+        if provider == PROVIDER_BAI:
+            return bai_list_models(runtime)
+        if provider == PROVIDER_OPENROUTER:
+            return runtime.openrouter_list_models()
+        if provider == PROVIDER_TOKENROUTER:
+            return runtime.tokenrouter_list_models()
+        if provider == PROVIDER_NOTION:
+            return runtime.notion_list_models()
+        if provider == PROVIDER_NIM:
+            return runtime.nim_list_models()
+        return []
+
     def providers(request: Request) -> dict[str, Any]:
+        """Fast admin bootstrap: local state only, never waits on provider APIs."""
         runtime.require_admin(request)
-        openrouter_ready = runtime.openrouter_configured()
-        notion_ready = runtime.notion_configured()
-        nim_ready = runtime.nim_configured()
+        active_provider = get_active_provider(runtime)
         return {
-            "active_provider": get_active_provider(runtime),
+            "active_provider": active_provider,
             "active_model": get_active_model(runtime),
             "providers": [
-                {"id": PROVIDER_CHATGPT, "label": PROVIDER_LABELS[PROVIDER_CHATGPT], "configured": True, "models": list(CHATGPT_ADMIN_MODELS)},
-                {"id": PROVIDER_BAI, "label": PROVIDER_LABELS[PROVIDER_BAI], "configured": bai_configured(runtime), "models": bai_list_models(runtime) if bai_configured(runtime) else []},
-                {"id": PROVIDER_OPENROUTER, "label": PROVIDER_LABELS[PROVIDER_OPENROUTER], "configured": openrouter_ready, "models": runtime.openrouter_list_models() if openrouter_ready else list(OPENROUTER_PUBLIC_CATALOG)},
-                {"id": PROVIDER_NOTION, "label": PROVIDER_LABELS[PROVIDER_NOTION], "configured": notion_ready, "models": runtime.notion_list_models() if notion_ready else list(NOTION_PUBLIC_CATALOG)},
-                {"id": PROVIDER_NIM, "label": PROVIDER_LABELS[PROVIDER_NIM], "configured": nim_ready, "models": runtime.nim_list_models() if nim_ready else list(NIM_PUBLIC_CATALOG)},
+                {
+                    "id": provider,
+                    "label": PROVIDER_LABELS[provider],
+                    "configured": provider_configured(provider),
+                    "models": fallback_models(provider),
+                }
+                for provider in KNOWN_PROVIDERS
             ],
+        }
+
+    def provider_models(request: Request, provider: str) -> dict[str, Any]:
+        """Fetch one provider catalog on demand after the admin UI is visible."""
+        runtime.require_admin(request)
+        if provider not in KNOWN_PROVIDERS:
+            raise HTTPException(status_code=404, detail=f"Unsupported provider: {provider}.")
+        configured = provider_configured(provider)
+        fallback = fallback_models(provider)
+        if provider != PROVIDER_CHATGPT and not configured:
+            return {"provider": provider, "configured": False, "models": fallback, "source": "fallback"}
+        models = live_models(provider)
+        return {
+            "provider": provider,
+            "configured": configured,
+            "models": models or fallback,
+            "source": "live" if models else "fallback",
         }
 
     def select_provider(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
@@ -480,6 +563,7 @@ def install(runtime: Any) -> None:
 
     runtime.app.add_api_route("/v1/models", models_endpoint, methods=["GET"])
     runtime.app.add_api_route("/auth/providers", providers, methods=["GET"])
+    runtime.app.add_api_route("/auth/providers/{provider}/models", provider_models, methods=["GET"])
     runtime.app.add_api_route("/auth/providers/select", select_provider, methods=["POST"])
 
     def list_clients(request: Request) -> dict[str, Any]:
@@ -513,3 +597,26 @@ def install(runtime: Any) -> None:
     runtime.app.add_api_route("/auth/clients", create_client, methods=["POST"])
     runtime.app.add_api_route("/auth/clients/{client_id}", update_client, methods=["POST"])
     runtime.app.add_api_route("/auth/clients/{client_id}", delete_client, methods=["DELETE"])
+
+    # Mirror admin JSON endpoints under /admin-api. This gives deployments a
+    # neutral management path when enterprise web filters aggressively classify
+    # generic /auth URLs, while preserving every existing /auth route.
+    existing_aliases = {
+        (getattr(route, "path", ""), tuple(sorted(getattr(route, "methods", None) or ())))
+        for route in runtime.app.router.routes
+    }
+    for route in list(runtime.app.router.routes):
+        path = getattr(route, "path", "")
+        methods = getattr(route, "methods", None)
+        endpoint = getattr(route, "endpoint", None)
+        if not path.startswith("/auth/") or not methods or endpoint is None:
+            continue
+        alias = "/admin-api" + path[len("/auth"):]
+        route_methods = sorted(method for method in methods if method not in {"HEAD", "OPTIONS"})
+        if not route_methods:
+            continue
+        signature = (alias, tuple(route_methods))
+        if signature in existing_aliases:
+            continue
+        runtime.app.add_api_route(alias, endpoint, methods=route_methods, include_in_schema=False)
+        existing_aliases.add(signature)

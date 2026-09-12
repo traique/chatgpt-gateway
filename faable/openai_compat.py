@@ -577,6 +577,7 @@ def install(runtime: Any) -> None:
         passthrough = {
             "bai": (runtime.bai_request, "B.AI"),
             "openrouter": (runtime.openrouter_request, "OpenRouter"),
+            "tokenrouter": (runtime.tokenrouter_request, "TokenRouter"),
             "nim": (runtime.nim_request, "NVIDIA NIM"),
         }.get(active)
         if passthrough is not None:
@@ -618,6 +619,16 @@ def install(runtime: Any) -> None:
                 detail=f"{unsupported_labels[active]} does not support /v1/responses. Use /v1/chat/completions.",
             )
         requested_model = str(payload.get("model") or DEFAULT_PUBLIC_MODEL)
+        if active == "tokenrouter":
+            provider_resolver = getattr(runtime, "resolve_provider_model", None)
+            effective_model = provider_resolver(active, requested_model) if provider_resolver else requested_model
+            tokenrouter_payload = {**payload, "model": effective_model}
+            response = runtime.tokenrouter_request(
+                "/responses",
+                json_payload=tokenrouter_payload,
+                stream=bool(payload.get("stream", False)),
+            )
+            return _passthrough_response(response, bool(payload.get("stream", False)), "TokenRouter")
         if active == "bai":
             bai_payload = {**payload, "model": _resolved_model(runtime, requested_model, DEFAULT_PUBLIC_MODEL)}
             response = runtime.bai_request("/responses", json_payload=bai_payload, stream=bool(payload.get("stream", False)))

@@ -1,9 +1,9 @@
 """Notion AI provider: browser-assisted/token_v2 login + runInferenceTranscript.
 
-Admins can either paste a ``token_v2`` value or use a local browser-assisted
-flow that opens an isolated Chrome/Edge profile on the gateway machine and
-extracts only ``token_v2`` after a normal Notion sign-in. The gateway resolves
-user/workspace metadata via loadUserContent and stores only the token encrypted.
+Admins can either paste a ``token_v2`` value together with optional Notion
+session identity cookies (``notion_user_id`` / ``notion_users``), or use a local
+browser-assisted flow that opens an isolated Chrome/Edge profile on the gateway
+machine and captures the minimal Notion web session after a normal sign-in.
 """
 from __future__ import annotations
 
@@ -17,9 +17,10 @@ from typing import Any
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from .notion_browser_auth import browser_login_capability, capture_token_v2
+from .notion_browser_auth import browser_login_capability, capture_notion_session
 
 NOTION_API_BASE = "https://app.notion.com/api/v3"
+NOTION_BOOTSTRAP_BASES = (NOTION_API_BASE, "https://www.notion.so/api/v3")
 NOTION_IMPERSONATE = "chrome131"
 DEFAULT_NOTION_CLIENT_VERSION = "23.13.20260710.0022"
 DEFAULT_NOTION_USER_AGENT = (
@@ -133,7 +134,7 @@ def notion_list_models(runtime: Any) -> list[str]:
             headers=headers,
             json={"spaceId": account["space_id"]},
             impersonate=NOTION_IMPERSONATE,
-            timeout=15,
+            timeout=6,
         )
         payload = response.json() if response.status_code == 200 else None
     except Exception:
@@ -176,23 +177,33 @@ def build_cookie_header(account: dict[str, Any]) -> str:
     full_cookie = str(account.get("full_cookie") or "").strip().rstrip(";")
     if full_cookie:
         return full_cookie
-    user_id = str(account.get("user_id") or "")
-    return "; ".join([
+    user_id = str(account.get("user_id") or "").strip()
+    notion_users = str(account.get("notion_users") or "").strip()
+    parts = [
         f"notion_browser_id={account.get('browser_id') or uuid.uuid4()}",
         f"device_id={account.get('device_id') or uuid.uuid4()}",
-        f"notion_user_id={user_id}",
-        f"notion_users=[%22{user_id}%22]",
+    ]
+    if user_id:
+        parts.append(f"notion_user_id={user_id}")
+    if notion_users:
+        parts.append(f"notion_users={notion_users}")
+    elif user_id:
+        # Compatibility fallback only. When the real notion_users cookie is
+        # available we keep its exact browser value instead of synthesizing it.
+        parts.append(f"notion_users=[%22{user_id}%22]")
+    parts.extend([
         "notion_check_cookie_consent=false",
         "notion_locale=en-US/autodetect",
         f"token_v2={account.get('token_v2') or ''}",
     ])
+    return "; ".join(parts)
 
 
 def notion_request_headers(account: dict[str, Any], *, accept: str = "application/x-ndjson") -> dict[str, str]:
     user_agent = str(account.get("user_agent") or DEFAULT_NOTION_USER_AGENT)
     major = re.search(r"Chrome/(\d+)", user_agent)
     chrome_major = int(major.group(1)) if major else 150
-    return {
+    headers = {
         "accept": accept,
         "accept-language": "en-US,en;q=0.9",
         "content-type": "application/json",
@@ -211,73 +222,194 @@ def notion_request_headers(account: dict[str, Any], *, accept: str = "applicatio
         "sec-fetch-site": "same-origin",
         "cookie": build_cookie_header(account),
     }
+    return {key: value for key, value in headers.items() if value}
+
+
+def _normalize_cookie_value(value: str, name: str, *, required: bool = False) -> str:
+    """Accept a cookie value (or ``name=value``) without accepting a full cookie header."""
+    normalized = str(value or "").strip()
+    prefix = f"{name}="
+    if normalized.startswith(prefix):
+        normalized = normalized[len(prefix):].strip()
+    if required and not normalized:
+        raise HTTPException(status_code=400, detail=f"{name} is required.")
+    if ";" in normalized:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Paste only the {name} value, not the full Notion cookie string.",
+        )
+    return normalized
 
 
 def normalize_token_v2(value: str) -> str:
-    """Normalize a token_v2 value while rejecting a pasted full cookie string."""
-    token = str(value or "").strip()
-    if token.startswith("token_v2="):
-        token = token[len("token_v2="):].strip()
-    if not token:
-        raise HTTPException(status_code=400, detail="token_v2 is required.")
-    if ";" in token:
-        raise HTTPException(status_code=400, detail="Paste only the token_v2 value, not the full Notion cookie string.")
-    return token
+    return _normalize_cookie_value(value, "token_v2", required=True)
 
 
-def bootstrap_notion_account(runtime: Any, token_v2: str) -> dict[str, Any]:
-    """Resolve user/space info from a token_v2 session value via loadUserContent."""
+def normalize_notion_user_id(value: str) -> str:
+    return _normalize_cookie_value(value, "notion_user_id")
+
+
+def normalize_notion_users(value: str) -> str:
+    return _normalize_cookie_value(value, "notion_users")
+
+
+def _record_value(record: Any) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {}
+    value = record.get("value")
+    if not isinstance(value, dict):
+        return {}
+    nested = value.get("value")
+    return nested if isinstance(nested, dict) else value
+
+
+def _bootstrap_headers(account: dict[str, Any], base_url: str) -> dict[str, str]:
+    headers = notion_request_headers(account, accept="application/json")
+    if "notion.so" in base_url:
+        headers["origin"] = "https://www.notion.so"
+        headers["referer"] = "https://www.notion.so/"
+    else:
+        headers["origin"] = "https://app.notion.com"
+        headers["referer"] = "https://app.notion.com/"
+    return headers
+
+
+def bootstrap_notion_account(
+    runtime: Any,
+    token_v2: str,
+    *,
+    session_cookie: str = "",
+    user_id: str = "",
+    notion_users: str = "",
+    browser_id: str = "",
+    device_id: str = "",
+    user_agent: str = "",
+) -> dict[str, Any]:
+    """Resolve user/workspace metadata from a Notion web session.
+
+    Manual login may provide only token_v2. Browser-assisted login passes the
+    real browser/session identifiers as well, which is more reliable with
+    Notion's current private API trust checks.
+    """
     token_v2 = normalize_token_v2(token_v2)
+    parsed_cookie = parse_browser_cookie(session_cookie) if session_cookie else {}
+    normalized_user_id = normalize_notion_user_id(user_id or parsed_cookie.get("notion_user_id") or "")
+    normalized_notion_users = normalize_notion_users(notion_users or parsed_cookie.get("notion_users") or "")
     account: dict[str, Any] = {
         "token_v2": token_v2,
-        "full_cookie": f"token_v2={token_v2}",
-        "user_id": "",
-        "browser_id": str(uuid.uuid4()),
-        "device_id": str(uuid.uuid4()),
+        "full_cookie": str(session_cookie or "").strip().rstrip(";"),
+        "user_id": normalized_user_id,
+        "notion_users": normalized_notion_users,
+        "browser_id": str(browser_id or parsed_cookie.get("notion_browser_id") or uuid.uuid4()),
+        "device_id": str(device_id or parsed_cookie.get("device_id") or uuid.uuid4()),
+        "user_agent": str(user_agent or DEFAULT_NOTION_USER_AGENT),
         "timezone": NOTION_DEFAULT_TIMEZONE,
     }
-    headers = notion_request_headers(account, accept="application/json")
-    headers["referer"] = "https://app.notion.com/"
-    try:
-        response = runtime.requests.post(
-            f"{NOTION_API_BASE}/loadUserContent",
-            headers=headers,
-            json={"cursor": {"stack": []}, "limit": 100},
-            impersonate=NOTION_IMPERSONATE,
-            timeout=30,
-        )
-    except Exception as error:
-        raise HTTPException(status_code=502, detail=f"Notion transport failed: {error}") from error
-    if response.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"loadUserContent failed (HTTP {response.status_code}). token_v2 may be expired.")
-    record_map = (response.json() or {}).get("recordMap") or {}
-    user_id = account["user_id"] or next(iter(record_map.get("notion_user") or {}), "")
-    if not user_id:
-        raise HTTPException(status_code=502, detail="Could not determine Notion user_id from token_v2.")
-    account["user_id"] = user_id
-    user_entry = ((record_map.get("notion_user") or {}).get(user_id) or {}).get("value") or {}
-    user_value = user_entry.get("value") or user_entry
-    name_list = user_value.get("name") or []
-    account["user_name"] = name_list[0][0] if name_list and name_list[0] else ""
-    account["user_email"] = str(user_value.get("email") or "")
-    space_id = account.get("space_id") or ""
-    space_name = account.get("space_name") or ""
-    space_view_id = ""
-    for record in (record_map.get("space") or {}).values():
-        value = (record.get("value") or {})
-        candidate = str(value.get("id") or "")
-        if not candidate:
+
+    attempts: list[str] = []
+    data: dict[str, Any] | None = None
+    for base_url in dict.fromkeys(NOTION_BOOTSTRAP_BASES):
+        headers = _bootstrap_headers(account, base_url)
+        try:
+            response = runtime.requests.post(
+                f"{base_url}/loadUserContent",
+                headers=headers,
+                json={"cursor": {"stack": []}, "limit": 100},
+                impersonate=NOTION_IMPERSONATE,
+                timeout=30,
+            )
+        except Exception as error:
+            attempts.append(f"{base_url}: transport {error}")
             continue
-        if not space_id or candidate == account.get("preferred_space_id"):
+        if response.status_code == 200:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                data = payload
+                break
+            attempts.append(f"{base_url}: HTTP 200 but invalid JSON")
+            continue
+        body = str(getattr(response, "text", "") or "").strip().replace("\n", " ")[:180]
+        suffix = f" ({body})" if body else ""
+        attempts.append(f"{base_url}: HTTP {response.status_code}{suffix}")
+
+    if data is None:
+        joined = "; ".join(attempts) or "no response"
+        if any("HTTP 401" in item for item in attempts):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Notion rejected the web session (HTTP 401). This does not always mean token_v2 expired: "
+                    "a token copied without the matching active-user/session cookies can be rejected. Use Browser "
+                    "Login, or paste token_v2 + notion_user_id + notion_users from the same Notion session. "
+                    f"Attempts: {joined}"
+                ),
+            )
+        if any("HTTP 403" in item for item in attempts):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Notion rejected the session (HTTP 403). The browser session/IP trust check may not match the "
+                    "gateway machine. Use Browser Login on the gateway machine/network when possible. "
+                    f"Attempts: {joined}"
+                ),
+            )
+        raise HTTPException(status_code=502, detail=f"loadUserContent failed. Attempts: {joined}")
+
+    record_map = data.get("recordMap") or {}
+    if not isinstance(record_map, dict):
+        raise HTTPException(status_code=502, detail="Notion loadUserContent returned an invalid recordMap.")
+    users = record_map.get("notion_user") or {}
+    resolved_user_id = account["user_id"] or (next(iter(users), "") if isinstance(users, dict) else "")
+    if not resolved_user_id:
+        raise HTTPException(status_code=502, detail="Could not determine Notion user_id from the authenticated session.")
+    account["user_id"] = str(resolved_user_id)
+    user_value = _record_value((users.get(resolved_user_id) if isinstance(users, dict) else {}) or {})
+    name_value = user_value.get("name") or []
+    if isinstance(name_value, str):
+        account["user_name"] = name_value
+    else:
+        account["user_name"] = name_value[0][0] if name_value and isinstance(name_value[0], list) and name_value[0] else ""
+    account["user_email"] = str(user_value.get("email") or "")
+
+    space_id = ""
+    space_name = ""
+    space_view_id = ""
+    space_map = record_map.get("space") or {}
+    view_map = record_map.get("space_view") or {}
+    if isinstance(view_map, dict):
+        for view_id, record in view_map.items():
+            view_value = _record_value(record)
+            candidate_space = str(view_value.get("space_id") or view_value.get("parent_id") or "")
+            if not candidate_space:
+                continue
+            space_id = candidate_space
+            space_view_id = str(view_value.get("id") or view_id or "")
+            if isinstance(space_map, dict):
+                space_value = _record_value(space_map.get(space_id) or {})
+                raw_name = space_value.get("name") or ""
+                if isinstance(raw_name, list):
+                    space_name = raw_name[0][0] if raw_name and isinstance(raw_name[0], list) and raw_name[0] else ""
+                else:
+                    space_name = str(raw_name)
+            break
+    if not space_id and isinstance(space_map, dict):
+        for key, record in space_map.items():
+            space_value = _record_value(record)
+            candidate = str(space_value.get("id") or key or "")
+            if not candidate:
+                continue
             space_id = candidate
-            space_name = str(value.get("name") or space_name)
-    for record in (record_map.get("space_view") or {}).values():
-        value = record.get("value") or {}
-        if str(value.get("space_id") or "") == space_id:
-            space_view_id = str(value.get("id") or "")
+            raw_name = space_value.get("name") or ""
+            if isinstance(raw_name, list):
+                space_name = raw_name[0][0] if raw_name and isinstance(raw_name[0], list) and raw_name[0] else ""
+            else:
+                space_name = str(raw_name)
             break
     if not space_id:
-        raise HTTPException(status_code=502, detail="No Notion workspace found for token_v2.")
+        raise HTTPException(status_code=502, detail="No Notion workspace found for the authenticated session.")
     account["space_id"] = space_id
     account["space_name"] = space_name
     account["space_view_id"] = space_view_id
@@ -368,8 +500,17 @@ def _get_notion_browser_login(runtime: Any, login_id: str) -> dict[str, Any] | N
 def _run_notion_browser_login(runtime: Any, login_id: str, label: str, timeout_seconds: int = 300) -> None:
     try:
         _update_notion_browser_login(runtime, login_id, status="browser_open")
-        token_v2 = capture_token_v2(timeout_seconds=timeout_seconds)
-        account = bootstrap_notion_account(runtime, token_v2)
+        session = capture_notion_session(timeout_seconds=timeout_seconds)
+        account = bootstrap_notion_account(
+            runtime,
+            session["token_v2"],
+            session_cookie=session.get("cookie", ""),
+            user_id=session.get("notion_user_id", ""),
+            notion_users=session.get("notion_users", ""),
+            browser_id=session.get("notion_browser_id", ""),
+            device_id=session.get("device_id", ""),
+            user_agent=session.get("user_agent", ""),
+        )
         account_id = save_notion_account(runtime, label, account)
         _update_notion_browser_login(runtime, login_id, status="completed", account_id=account_id)
     except TimeoutError as error:
@@ -447,16 +588,28 @@ def get_active_notion_account(runtime: Any) -> dict[str, Any]:
     stored = row["cookie_enc"]
     if runtime.DATABASE_URL:
         stored = runtime.decrypt_token(stored)
-    # Backward compatible with older rows that stored the complete cookie string.
-    token_v2 = parse_browser_cookie(stored).get("token_v2") if "=" in stored else stored
-    token_v2 = normalize_token_v2(token_v2 or "")
-    return {**row, "full_cookie": f"token_v2={token_v2}", "token_v2": token_v2}
+    # Backward compatible with rows that store either token_v2 only or a minimal browser session cookie.
+    parsed = parse_browser_cookie(stored) if "=" in stored else {}
+    token_v2 = normalize_token_v2(parsed.get("token_v2") or stored)
+    return {
+        **row,
+        "full_cookie": stored if parsed else "",
+        "token_v2": token_v2,
+        "browser_id": parsed.get("notion_browser_id", ""),
+        "device_id": parsed.get("device_id", ""),
+        "user_id": row.get("user_id") or parsed.get("notion_user_id", ""),
+        "notion_users": parsed.get("notion_users", ""),
+    }
 
 
 def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> str:
     account_id = str(uuid.uuid4())
     token_v2 = normalize_token_v2(str(account.get("token_v2") or ""))
-    encrypted = runtime.encrypt_token(token_v2) if runtime.DATABASE_URL else token_v2
+    session_cookie = str(account.get("full_cookie") or "").strip().rstrip(";")
+    # Persist a stable minimal session. Manual token_v2 login gets generated
+    # browser/device ids plus the resolved user id; browser login keeps the real values.
+    stored_credential = session_cookie if session_cookie and "token_v2=" in session_cookie else build_cookie_header(account)
+    encrypted = runtime.encrypt_token(stored_credential) if runtime.DATABASE_URL else stored_credential
     now = int(time.time() * 1000)
     if not runtime.DATABASE_URL:
         for entry in _memory_notion_accounts.values():
@@ -1005,7 +1158,7 @@ def aggregate_notion_chat(response: Any, requested_model: str) -> dict[str, Any]
 
 
 def install(runtime: Any) -> None:
-    runtime.notion_bootstrap = lambda token_v2: bootstrap_notion_account(runtime, token_v2)
+    runtime.notion_bootstrap = lambda token_v2, **kwargs: bootstrap_notion_account(runtime, token_v2, **kwargs)
     runtime.notion_configured = lambda: notion_configured(runtime)
     runtime.notion_request = lambda payload: notion_inference_request(runtime, payload)
     runtime.resolve_notion_model = resolve_notion_model
@@ -1014,8 +1167,15 @@ def install(runtime: Any) -> None:
     def notion_login(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
         runtime.require_admin(request)
         token_v2 = normalize_token_v2(str(payload.get("token_v2") or ""))
+        notion_user_id = normalize_notion_user_id(str(payload.get("notion_user_id") or ""))
+        notion_users = normalize_notion_users(str(payload.get("notion_users") or ""))
         label = str(payload.get("label") or "").strip()[:100] or f"Notion {time.strftime('%Y-%m-%d %H:%M')}"
-        account = bootstrap_notion_account(runtime, token_v2)
+        account = bootstrap_notion_account(
+            runtime,
+            token_v2,
+            user_id=notion_user_id,
+            notion_users=notion_users,
+        )
         account_id = save_notion_account(runtime, label, account)
         return {"ok": True, "id": account_id, "data": notion_account_rows(runtime)}
 
