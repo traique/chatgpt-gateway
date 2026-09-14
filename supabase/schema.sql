@@ -103,3 +103,18 @@ alter table public.notion_browser_login_sessions enable row level security;
 
 alter table public.chatgpt_accounts enable row level security;
 alter table public.device_login_sessions enable row level security;
+
+create table if not exists public.gateway_dynamic_providers (
+    id text primary key,
+    name text not null,
+    base_url text not null,
+    api_key_enc text not null,
+    model text not null,
+    created_at bigint not null,
+    updated_at bigint not null
+);
+
+create index if not exists gateway_dynamic_providers_created_at_idx
+    on public.gateway_dynamic_providers (created_at);
+
+alter table public.gateway_dynamic_providers enable row level security;
