@@ -5,6 +5,24 @@ FastAPI gateway chạy trên **Faable**, kết nối ChatGPT/Codex upstream bằ
 
 > ChatGPT/Codex authentication và backend endpoint là private/internal interfaces và có thể thay đổi. Gateway không phải OpenAI Public API.
 
+### v0.5.3 · ChatGPT routing + SSE overload recovery
+
+- Cô lập model ChatGPT khỏi model của custom/generic provider khi global route và client-key route khác nhau.
+- `/v1/chat/completions` giờ build Codex payload bằng **model đã resolve**, không dùng lại model hard-code từ request của bot.
+- `/v1/responses` áp cùng model resolver trước khi gọi ChatGPT/Codex.
+- Khi ChatGPT trả `server_is_overloaded` bên trong SSE trước khi có output, gateway retry tối đa **1 lần** và không phát response lỗi đầu tiên cho client.
+- Retry chỉ áp dụng cho lỗi transient trước output; lỗi auth/model và lỗi sau khi đã stream output vẫn được trả nguyên trạng để tránh request lặp ngoài ý muốn.
+
+### v0.5.2 · Admin UI stability
+
+- Rebuilt the admin layout with a single mobile breakpoint stack (no overlapping mobile CSS rules).
+- Removed `content-visibility` from dashboard cards to prevent blank/oversized tiles on mobile browsers.
+- Mobile navigation is now sticky below the top bar instead of fixed over content.
+- Dynamic provider editor and client-key creation are collapsed until needed.
+- Built-in connectors use lightweight accordions, reducing visual clutter and initial paint work.
+- Liquid-glass effects remain lightweight on mobile: no backdrop blur, no external assets, no frontend build step.
+
+
 ## Kiến trúc
 
 ```text
