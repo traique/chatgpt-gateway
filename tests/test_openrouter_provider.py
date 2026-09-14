@@ -182,7 +182,7 @@ def test_providers_endpoint_lists_all_providers(monkeypatch) -> None:
 
     assert response.status_code == 200
     ids = [p["id"] for p in response.json()["providers"]]
-    assert ids == ["chatgpt", "bai", "openrouter", "tokenrouter", "notion", "nim"]
+    assert ids == ["chatgpt", "bai", "openrouter", "tokenrouter", "notion", "nim", "generic"]
 
 
 def test_client_key_can_target_openrouter(monkeypatch) -> None:

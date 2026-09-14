@@ -82,3 +82,12 @@ def test_admin_alias_is_html_with_security_headers() -> None:
     assert response.headers['cache-control'].startswith('no-store')
     assert response.headers['x-frame-options'] == 'DENY'
     assert "frame-ancestors 'none'" in response.headers['content-security-policy']
+
+
+def test_admin_html_is_mobile_first_and_lazy() -> None:
+    response = client.get('/admin')
+    assert response.status_code == 200
+    assert 'class="mobile-dock"' in response.text
+    assert "IntersectionObserver" in response.text
+    assert "backdrop-filter:none" in response.text
+    assert "font-size:16px" in response.text

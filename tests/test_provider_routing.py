@@ -15,12 +15,16 @@ from faable.provider_routing import resolve_model
 def reset_provider_state():
     provider_routing._memory_settings.clear()
     provider_routing._memory_clients.clear()
+    provider_routing._settings_cache.clear()
+    provider_routing._client_policy_cache.clear()
     provider_routing._models_cache = {"ts": 0.0, "models": []}
     original = (runtime.BAI_API_KEY, runtime.BAI_BASE_URL)
     yield
     runtime.BAI_API_KEY, runtime.BAI_BASE_URL = original
     provider_routing._memory_settings.clear()
     provider_routing._memory_clients.clear()
+    provider_routing._settings_cache.clear()
+    provider_routing._client_policy_cache.clear()
     provider_routing._models_cache = {"ts": 0.0, "models": []}
 
 
@@ -66,7 +70,7 @@ def test_providers_endpoint_lists_providers(monkeypatch) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["active_provider"] == "chatgpt"
-    assert [p["id"] for p in body["providers"]] == ["chatgpt", "bai", "openrouter", "tokenrouter", "notion", "nim"]
+    assert [p["id"] for p in body["providers"]] == ["chatgpt", "bai", "openrouter", "tokenrouter", "notion", "nim", "generic"]
     chatgpt = body["providers"][0]
     assert chatgpt["configured"] is True
     assert "chatgpt-gpt-5.6" in chatgpt["models"]
@@ -482,3 +486,50 @@ def test_admin_api_aliases_keep_all_methods() -> None:
     assert ('/admin-api/tokenrouter/key', ('POST',)) in route_methods
     assert ('/admin-api/nim/key', ('GET',)) in route_methods
     assert ('/admin-api/nim/key', ('POST',)) in route_methods
+
+
+def test_persisted_setting_cache_avoids_repeat_db_selects() -> None:
+    class Result:
+        def fetchone(self):
+            return ("bai",)
+
+    class Connection:
+        def __init__(self):
+            self.selects = 0
+
+        def execute(self, sql, params=None):
+            if sql.startswith("SELECT value"):
+                self.selects += 1
+                return Result()
+            return self
+
+    class DbContext:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __enter__(self):
+            return self.connection
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    connection = Connection()
+
+    class FakeRuntime:
+        DATABASE_URL = "postgres://cache-test"
+
+        @staticmethod
+        def db():
+            return DbContext(connection)
+
+    fake = FakeRuntime()
+    provider_routing._settings_cache.clear()
+    old_ready = provider_routing._settings_table_ready
+    provider_routing._settings_table_ready = True
+    try:
+        assert provider_routing._get_setting(fake, "active_provider") == "bai"
+        assert provider_routing._get_setting(fake, "active_provider") == "bai"
+        assert connection.selects == 1
+    finally:
+        provider_routing._settings_table_ready = old_ready
+        provider_routing._settings_cache.clear()
