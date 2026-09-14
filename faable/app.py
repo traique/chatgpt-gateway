@@ -36,7 +36,7 @@ CODEX_REFERER = "https://chatgpt.com/"
 CODEX_USER_AGENT = "codex_cli_rs/0.144.1"
 DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
 
-app = FastAPI(title="chatgpt-gateway", version="0.5.1", docs_url=None, redoc_url=None)
+app = FastAPI(title="chatgpt-gateway", version="0.5.3", docs_url=None, redoc_url=None)
 if SESSION_SECRET:
     app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, max_age=43200, same_site="lax", https_only=True)
 

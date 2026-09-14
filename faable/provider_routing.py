@@ -231,25 +231,35 @@ def bai_configured(runtime: Any) -> bool:
     return bool(getattr(runtime, "BAI_API_KEY", ""))
 
 
+def _valid_chatgpt_model(value: Any) -> str:
+    model = str(value or "").strip()
+    return model if model in DEFAULT_MODEL_ALIASES or model in CHATGPT_ADMIN_MODELS else ""
+
+
 def resolve_model(runtime: Any, requested: Any, default: str) -> str:
-    """Return the model the client asked for, unless it is empty/an alias —
-    then fall back to the client's model, the admin's global pick, or the default."""
+    """Resolve a model without leaking one provider's model into another.
+
+    ChatGPT/Codex is stricter than OpenAI-compatible providers. 9Router-style
+    clients often keep the model id from a previously selected provider, so a
+    client pinned to ChatGPT must only ever receive a ChatGPT/Codex model.
+    """
     model = str(requested or "").strip()
     policy = get_client_policy()
     global_provider = get_active_provider(runtime)
     effective_provider = policy.get("provider") if policy and policy.get("provider") else global_provider
-    # Clients commonly retain a generic default such as `gpt-4o-mini` when
-    # pointed at a new base URL. It is not a Codex backend model, so forwarding
-    # it makes the ChatGPT route fail. Treat unknown ids as aliases only for
-    # the ChatGPT provider; third-party providers retain their own catalogs.
-    if effective_provider == PROVIDER_CHATGPT and model and model not in DEFAULT_MODEL_ALIASES and model not in CHATGPT_ADMIN_MODELS:
-        if policy and policy.get("model"):
-            return policy["model"]
-        if not policy or policy.get("provider") == global_provider:
-            active = get_active_model(runtime)
-            if active:
-                return active
-        return default
+
+    if effective_provider == PROVIDER_CHATGPT:
+        requested_chatgpt_model = _valid_chatgpt_model(model)
+        policy_model = _valid_chatgpt_model(policy.get("model")) if policy and policy.get("provider") == PROVIDER_CHATGPT else ""
+        active_model = _valid_chatgpt_model(get_active_model(runtime)) if global_provider == PROVIDER_CHATGPT else ""
+
+        # Generic public aliases intentionally defer to an explicit ChatGPT
+        # client/admin choice. Unknown third-party model ids are never forwarded
+        # to the private Codex backend.
+        if model in DEFAULT_MODEL_ALIASES or not requested_chatgpt_model:
+            return policy_model or active_model or default
+        return requested_chatgpt_model
+
     if model in DEFAULT_MODEL_ALIASES:
         if policy and policy.get("model"):
             return policy["model"]
