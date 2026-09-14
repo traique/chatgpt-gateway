@@ -772,8 +772,15 @@ def _native_messages_passthrough(runtime: Any, payload: dict[str, Any], requeste
     requesters = {
         "openrouter": (runtime.openrouter_request, "OpenRouter"),
         "nim": (runtime.nim_request, "NVIDIA NIM"),
+        "generic": (runtime.generic_request, "OpenAI Compatible"),
     }
-    requester, provider_label = requesters[provider]
+    if provider in requesters:
+        requester, provider_label = requesters[provider]
+    elif getattr(runtime, "is_dynamic_provider", lambda _provider: False)(provider):
+        requester = lambda path, **kwargs: runtime.dynamic_provider_request(provider, path, **kwargs)
+        provider_label = runtime.dynamic_provider_label(provider)
+    else:
+        raise HTTPException(status_code=404, detail=f"Unsupported provider: {provider}.")
     provider_resolver = getattr(runtime, "resolve_provider_model", None)
     if provider_resolver is not None:
         effective_model = provider_resolver(provider, requested_model)
@@ -830,7 +837,7 @@ def install(runtime: Any) -> None:
                 return _bai_messages_passthrough(runtime, payload, requested_model)
             if active == "tokenrouter":
                 return _tokenrouter_messages_passthrough(runtime, payload, requested_model)
-            if active in ("openrouter", "nim"):
+            if active in ("openrouter", "nim", "generic") or getattr(runtime, "is_dynamic_provider", lambda _provider: False)(active):
                 return _native_messages_passthrough(runtime, payload, requested_model, provider=active)
             if active == "notion":
                 return _anthropic_error_response(

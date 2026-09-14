@@ -579,7 +579,13 @@ def install(runtime: Any) -> None:
             "openrouter": (runtime.openrouter_request, "OpenRouter"),
             "tokenrouter": (runtime.tokenrouter_request, "TokenRouter"),
             "nim": (runtime.nim_request, "NVIDIA NIM"),
+            "generic": (runtime.generic_request, "OpenAI Compatible"),
         }.get(active)
+        if passthrough is None and getattr(runtime, "is_dynamic_provider", lambda _provider: False)(active):
+            passthrough = (
+                lambda path, **kwargs: runtime.dynamic_provider_request(active, path, **kwargs),
+                runtime.dynamic_provider_label(active),
+            )
         if passthrough is not None:
             requester, provider_label = passthrough
             # Stream upstream only when the client asked for it — curl_cffi
@@ -631,6 +637,27 @@ def install(runtime: Any) -> None:
                 stream=bool(payload.get("stream", False)),
             )
             return _passthrough_response(response, bool(payload.get("stream", False)), "TokenRouter")
+        if active == "generic":
+            provider_resolver = getattr(runtime, "resolve_provider_model", None)
+            effective_model = provider_resolver(active, requested_model) if provider_resolver else requested_model
+            generic_payload = {**payload, "model": effective_model}
+            response = runtime.generic_request(
+                "/responses",
+                json_payload=generic_payload,
+                stream=bool(payload.get("stream", False)),
+            )
+            return _passthrough_response(response, bool(payload.get("stream", False)), "OpenAI Compatible")
+        if getattr(runtime, "is_dynamic_provider", lambda _provider: False)(active):
+            provider_resolver = getattr(runtime, "resolve_provider_model", None)
+            effective_model = provider_resolver(active, requested_model) if provider_resolver else requested_model
+            dynamic_payload = {**payload, "model": effective_model}
+            response = runtime.dynamic_provider_request(
+                active,
+                "/responses",
+                json_payload=dynamic_payload,
+                stream=bool(payload.get("stream", False)),
+            )
+            return _passthrough_response(response, bool(payload.get("stream", False)), runtime.dynamic_provider_label(active))
         if active == "bai":
             bai_payload = {**payload, "model": _resolved_model(runtime, requested_model, DEFAULT_PUBLIC_MODEL)}
             response = runtime.bai_request("/responses", json_payload=bai_payload, stream=bool(payload.get("stream", False)))

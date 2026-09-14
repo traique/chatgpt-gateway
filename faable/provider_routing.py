@@ -17,7 +17,16 @@ PROVIDER_OPENROUTER = "openrouter"
 PROVIDER_TOKENROUTER = "tokenrouter"
 PROVIDER_NOTION = "notion"
 PROVIDER_NIM = "nim"
-KNOWN_PROVIDERS = (PROVIDER_CHATGPT, PROVIDER_BAI, PROVIDER_OPENROUTER, PROVIDER_TOKENROUTER, PROVIDER_NOTION, PROVIDER_NIM)
+PROVIDER_GENERIC = "generic"
+KNOWN_PROVIDERS = (
+    PROVIDER_CHATGPT,
+    PROVIDER_BAI,
+    PROVIDER_OPENROUTER,
+    PROVIDER_TOKENROUTER,
+    PROVIDER_NOTION,
+    PROVIDER_NIM,
+    PROVIDER_GENERIC,
+)
 DEFAULT_BAI_BASE_URL = "https://api.b.ai/v1"
 DEFAULT_MODEL_ALIASES = frozenset({"", "chatgpt-gpt-5.6", "gpt-5.6"})
 CHATGPT_ADMIN_MODELS = ("chatgpt-gpt-5.6", "gpt-5.6-terra", "gpt-5.6-codex")
@@ -28,6 +37,7 @@ PROVIDER_LABELS = {
     PROVIDER_TOKENROUTER: "TokenRouter",
     PROVIDER_NOTION: "Notion AI",
     PROVIDER_NIM: "NVIDIA NIM",
+    PROVIDER_GENERIC: "OpenAI Compatible",
 }
 OPENROUTER_PUBLIC_CATALOG: tuple[str, ...] = (
     "openrouter/auto",
@@ -70,10 +80,18 @@ PROVIDER_FALLBACK_CATALOGS: dict[str, tuple[str, ...]] = {
     PROVIDER_NIM: NIM_PUBLIC_CATALOG,
 }
 MODELS_CACHE_TTL_SECONDS = 60
+# Small in-process caches are intentionally short lived: they remove the hot-path
+# database round trips that hurt small/free instances while keeping admin changes
+# effectively immediate via explicit invalidation below.
+SETTINGS_CACHE_TTL_SECONDS = max(1, int(os.getenv("GATEWAY_SETTINGS_CACHE_TTL", "30")))
+CLIENT_POLICY_CACHE_TTL_SECONDS = max(1, int(os.getenv("GATEWAY_CLIENT_CACHE_TTL", "60")))
+CLIENT_POLICY_CACHE_MAX_ENTRIES = max(32, int(os.getenv("GATEWAY_CLIENT_CACHE_MAX", "256")))
 
 _models_cache: dict[str, Any] = {"ts": 0.0, "models": []}
 _memory_settings: dict[str, str] = {}
 _memory_clients: dict[str, dict[str, Any]] = {}
+_settings_cache: dict[tuple[int, str], tuple[float, str]] = {}
+_client_policy_cache: dict[tuple[int, str], tuple[float, dict[str, str]]] = {}
 _settings_table_ready = False
 _client_table_ready = False
 _client_policy: contextvars.ContextVar = contextvars.ContextVar("client_provider_policy", default=None)
@@ -104,6 +122,11 @@ def mask_client_key(value: str) -> str:
 def _get_setting(runtime: Any, key: str) -> str:
     if not runtime.DATABASE_URL:
         return _memory_settings.get(key, "")
+    cache_key = (id(runtime), key)
+    now = time.monotonic()
+    cached = _settings_cache.get(cache_key)
+    if cached and now - cached[0] < SETTINGS_CACHE_TTL_SECONDS:
+        return cached[1]
     global _settings_table_ready
     with runtime.db() as connection:
         if not _settings_table_ready:
@@ -113,7 +136,32 @@ def _get_setting(runtime: Any, key: str) -> str:
             )
             _settings_table_ready = True
         row = connection.execute("SELECT value FROM gateway_settings WHERE key=%s", (key,)).fetchone()
-    return str(row[0]) if row else ""
+    value = str(row[0]) if row else ""
+    _settings_cache[cache_key] = (now, value)
+    return value
+
+
+def _preload_settings(runtime: Any) -> None:
+    """Warm all small gateway settings with one DB round trip at process start.
+
+    Provider installers read several independent settings. Without this warm-up a
+    cold free-tier instance opens a fresh PostgreSQL connection for each key.
+    """
+    if not runtime.DATABASE_URL:
+        return
+    global _settings_table_ready
+    with runtime.db() as connection:
+        if not _settings_table_ready:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS gateway_settings ("
+                "key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL)"
+            )
+            _settings_table_ready = True
+        rows = connection.execute("SELECT key, value FROM gateway_settings").fetchall()
+    now = time.monotonic()
+    runtime_id = id(runtime)
+    for row in rows:
+        _settings_cache[(runtime_id, str(row[0]))] = (now, str(row[1]))
 
 
 def load_secret_setting(runtime: Any, key: str) -> str:
@@ -152,11 +200,20 @@ def _set_setting(runtime: Any, key: str, value: str) -> None:
             "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
             (key, value, int(time.time())),
         )
+    # Write-through makes admin changes visible immediately without another SELECT.
+    _settings_cache[(id(runtime), key)] = (time.monotonic(), value)
+
+
+def provider_exists(runtime: Any, provider: str) -> bool:
+    if provider in KNOWN_PROVIDERS:
+        return True
+    checker = getattr(runtime, "is_dynamic_provider", None)
+    return bool(checker and checker(provider))
 
 
 def get_active_provider(runtime: Any) -> str:
     value = _get_setting(runtime, "active_provider")
-    return value if value in KNOWN_PROVIDERS else PROVIDER_CHATGPT
+    return value if provider_exists(runtime, value) else PROVIDER_CHATGPT
 
 
 def get_active_model(runtime: Any) -> str:
@@ -164,7 +221,7 @@ def get_active_model(runtime: Any) -> str:
 
 
 def set_active_provider_model(runtime: Any, provider: str, model: str = "") -> None:
-    if provider not in KNOWN_PROVIDERS:
+    if not provider_exists(runtime, provider):
         raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}.")
     _set_setting(runtime, "active_provider", provider)
     _set_setting(runtime, "active_model", str(model or "").strip()[:200])
@@ -179,20 +236,27 @@ def resolve_model(runtime: Any, requested: Any, default: str) -> str:
     then fall back to the client's model, the admin's global pick, or the default."""
     model = str(requested or "").strip()
     policy = get_client_policy()
-    effective_provider = policy.get("provider") if policy and policy.get("provider") else get_active_provider(runtime)
+    global_provider = get_active_provider(runtime)
+    effective_provider = policy.get("provider") if policy and policy.get("provider") else global_provider
     # Clients commonly retain a generic default such as `gpt-4o-mini` when
     # pointed at a new base URL. It is not a Codex backend model, so forwarding
     # it makes the ChatGPT route fail. Treat unknown ids as aliases only for
     # the ChatGPT provider; third-party providers retain their own catalogs.
     if effective_provider == PROVIDER_CHATGPT and model and model not in DEFAULT_MODEL_ALIASES and model not in CHATGPT_ADMIN_MODELS:
-        active = get_active_model(runtime)
-        return active or default
+        if policy and policy.get("model"):
+            return policy["model"]
+        if not policy or policy.get("provider") == global_provider:
+            active = get_active_model(runtime)
+            if active:
+                return active
+        return default
     if model in DEFAULT_MODEL_ALIASES:
         if policy and policy.get("model"):
             return policy["model"]
-        active = get_active_model(runtime)
-        if active:
-            return active
+        if not policy or policy.get("provider") == global_provider:
+            active = get_active_model(runtime)
+            if active:
+                return active
     return model or default
 
 
@@ -203,6 +267,14 @@ def resolve_provider_model(runtime: Any, provider: str, requested: Any) -> str:
     unknown to the provider, fall back to the client key's model, the admin's
     global pick, or the first entry of the provider catalog."""
     model = str(requested or "").strip()
+    is_dynamic = bool(getattr(runtime, "is_dynamic_provider", lambda _provider: False)(provider))
+    if provider == PROVIDER_GENERIC and not runtime.generic_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Generic OpenAI-compatible provider is not configured. Set base_url, api_key, and model in /admin.",
+        )
+    if is_dynamic and not runtime.dynamic_provider_configured(provider):
+        raise HTTPException(status_code=503, detail="Custom OpenAI-compatible provider is not configured or no longer exists.")
     if provider == PROVIDER_BAI:
         catalog = bai_list_models(runtime)
     elif provider == PROVIDER_OPENROUTER:
@@ -213,6 +285,10 @@ def resolve_provider_model(runtime: Any, provider: str, requested: Any) -> str:
         catalog = runtime.notion_list_models()
     elif provider == PROVIDER_NIM:
         catalog = runtime.nim_list_models()
+    elif provider == PROVIDER_GENERIC:
+        catalog = runtime.generic_list_models()
+    elif is_dynamic:
+        catalog = runtime.dynamic_provider_list_models(provider)
     else:
         catalog = []
     if catalog and model and model not in DEFAULT_MODEL_ALIASES and model in catalog:
@@ -220,6 +296,11 @@ def resolve_provider_model(runtime: Any, provider: str, requested: Any) -> str:
     policy = get_client_policy()
     if policy and policy.get("model"):
         return policy["model"]
+    # A client key pinned to a different provider must not inherit the global
+    # model chosen for another provider. Prefer that client's provider default.
+    global_provider = get_active_provider(runtime)
+    if policy and policy.get("provider") and policy.get("provider") != global_provider and catalog:
+        return catalog[0]
     active = get_active_model(runtime)
     if active:
         return active
@@ -268,6 +349,12 @@ def _ensure_client_table(connection: Any) -> None:
         _client_table_ready = True
 
 
+def _clear_client_policy_cache(runtime: Any) -> None:
+    runtime_id = id(runtime)
+    for cache_key in [item for item in _client_policy_cache if item[0] == runtime_id]:
+        _client_policy_cache.pop(cache_key, None)
+
+
 def _lookup_client_policy(runtime: Any, supplied: str) -> dict[str, str] | None:
     key = supplied.strip()
     if not key:
@@ -278,6 +365,11 @@ def _lookup_client_policy(runtime: Any, supplied: str) -> dict[str, str] | None:
                 return {"provider": entry["provider"], "model": entry["model"]}
         return None
     digest = hash_client_key(key)
+    cache_key = (id(runtime), digest)
+    now = time.monotonic()
+    cached = _client_policy_cache.get(cache_key)
+    if cached and now - cached[0] < CLIENT_POLICY_CACHE_TTL_SECONDS:
+        return dict(cached[1])
     with runtime.db() as connection:
         _ensure_client_table(connection)
         row = connection.execute(
@@ -288,7 +380,11 @@ def _lookup_client_policy(runtime: Any, supplied: str) -> dict[str, str] | None:
         return None
     if not hmac.compare_digest(runtime.decrypt_token(str(row[2])), key):
         return None
-    return {"provider": str(row[0]), "model": str(row[1] or "")}
+    policy = {"provider": str(row[0]), "model": str(row[1] or "")}
+    if len(_client_policy_cache) >= CLIENT_POLICY_CACHE_MAX_ENTRIES:
+        _client_policy_cache.clear()
+    _client_policy_cache[cache_key] = (now, policy)
+    return dict(policy)
 
 
 def bai_request(
@@ -386,6 +482,7 @@ def _create_client(runtime: Any, label: str, key: str, provider: str, model: str
             "provider": provider, "model": model, "status": "active",
             "created_at": now, "updated_at": now,
         }
+        _clear_client_policy_cache(runtime)
         return client_id
     digest = hash_client_key(key)
     with runtime.db() as connection:
@@ -397,13 +494,14 @@ def _create_client(runtime: Any, label: str, key: str, provider: str, model: str
             "VALUES (%s,%s,%s,%s,%s,%s,'active',%s,%s)",
             (client_id, label, runtime.encrypt_token(key), digest, provider, model, now, now),
         )
+    _clear_client_policy_cache(runtime)
     return client_id
 
 
 def _update_client(runtime: Any, client_id: str, payload: dict[str, Any]) -> None:
     updates: list[tuple[str, Any]] = []
     if isinstance(payload.get("provider"), str):
-        if payload["provider"] not in KNOWN_PROVIDERS:
+        if not provider_exists(runtime, payload["provider"]):
             raise HTTPException(status_code=400, detail=f"Unsupported provider: {payload['provider']}.")
         updates.append(("provider", payload["provider"]))
     if isinstance(payload.get("model"), str):
@@ -432,6 +530,7 @@ def _update_client(runtime: Any, client_id: str, payload: dict[str, Any]) -> Non
                 entry["status"] = value
             elif field == "updated_at":
                 entry["updated_at"] = value
+        _clear_client_policy_cache(runtime)
         return
     assignments = ", ".join(f"{field}=%s" for field, _ in updates)
     values = [value for _, value in updates] + [client_id]
@@ -439,17 +538,29 @@ def _update_client(runtime: Any, client_id: str, payload: dict[str, Any]) -> Non
         _ensure_client_table(connection)
         if connection.execute(f"UPDATE gateway_api_keys SET {assignments} WHERE id=%s", tuple(values)).rowcount == 0:
             raise HTTPException(status_code=404, detail="Client key not found.")
+    _clear_client_policy_cache(runtime)
 
 
 def _delete_client(runtime: Any, client_id: str) -> None:
     if not runtime.DATABASE_URL:
         if _memory_clients.pop(client_id, None) is None:
             raise HTTPException(status_code=404, detail="Client key not found.")
+        _clear_client_policy_cache(runtime)
         return
     with runtime.db() as connection:
         _ensure_client_table(connection)
         if connection.execute("DELETE FROM gateway_api_keys WHERE id=%s", (client_id,)).rowcount == 0:
             raise HTTPException(status_code=404, detail="Client key not found.")
+    _clear_client_policy_cache(runtime)
+
+
+def _client_provider_usage(runtime: Any, provider: str) -> int:
+    if not runtime.DATABASE_URL:
+        return sum(1 for entry in _memory_clients.values() if entry.get("provider") == provider)
+    with runtime.db() as connection:
+        _ensure_client_table(connection)
+        row = connection.execute("SELECT COUNT(*) FROM gateway_api_keys WHERE provider=%s", (provider,)).fetchone()
+    return int(row[0]) if row else 0
 
 
 def install(runtime: Any) -> None:
@@ -457,6 +568,7 @@ def install(runtime: Any) -> None:
     runtime.BAI_BASE_URL = os.getenv("BAI_BASE_URL", DEFAULT_BAI_BASE_URL).strip().rstrip("/") or DEFAULT_BAI_BASE_URL
     runtime.get_active_provider = lambda: get_active_provider(runtime)
     runtime.get_active_model = lambda: get_active_model(runtime)
+    runtime.provider_exists = lambda provider: provider_exists(runtime, provider)
     runtime.set_active_provider_model = lambda provider, model="": set_active_provider_model(runtime, provider, model)
     runtime.bai_configured = lambda: bai_configured(runtime)
     runtime.resolve_model = lambda requested, default: resolve_model(runtime, requested, default)
@@ -468,13 +580,19 @@ def install(runtime: Any) -> None:
     runtime.set_client_policy = set_client_policy
     runtime.get_client_policy = get_client_policy
 
+    # Warm persisted provider/admin settings in one query so each provider installer
+    # does not open its own PostgreSQL connection during a free-tier cold start.
+    _preload_settings(runtime)
+
     # Lazy import to avoid a circular dependency (openrouter_provider reads settings helpers).
+    from faable.generic_provider import install as install_generic_provider
     from faable.nim_provider import install as install_nim_provider
     from faable.notion_provider import install as install_notion_provider
     from faable.openrouter_provider import install as install_openrouter_provider
     from faable.tokenrouter_provider import install as install_tokenrouter_provider
 
     install_notion_provider(runtime)
+    install_generic_provider(runtime)
     install_openrouter_provider(runtime)
     install_tokenrouter_provider(runtime)
     install_nim_provider(runtime)
@@ -506,6 +624,12 @@ def install(runtime: Any) -> None:
         elif active == PROVIDER_NIM:
             catalog = runtime.nim_list_models() or list(NIM_PUBLIC_CATALOG)
             owned_by = "nvidia-nim"
+        elif active == PROVIDER_GENERIC:
+            catalog = runtime.generic_list_models()
+            owned_by = "openai-compatible"
+        elif getattr(runtime, "is_dynamic_provider", lambda _provider: False)(active):
+            catalog = runtime.dynamic_provider_list_models(active)
+            owned_by = active
         else:
             catalog = list(getattr(runtime, "PUBLIC_MODEL_CATALOG", ("chatgpt-gpt-5.6",)))
             owned_by = "openai-chatgpt"
@@ -527,6 +651,10 @@ def install(runtime: Any) -> None:
             return runtime.notion_configured()
         if provider == PROVIDER_NIM:
             return runtime.nim_configured()
+        if provider == PROVIDER_GENERIC:
+            return runtime.generic_configured()
+        if getattr(runtime, "is_dynamic_provider", lambda _provider: False)(provider):
+            return runtime.dynamic_provider_configured(provider)
         return False
 
     def fallback_models(provider: str) -> list[str]:
@@ -540,10 +668,14 @@ def install(runtime: Any) -> None:
             return list(NOTION_PUBLIC_CATALOG)
         if provider == PROVIDER_NIM:
             return list(NIM_PUBLIC_CATALOG)
+        if provider == PROVIDER_GENERIC:
+            return runtime.generic_list_models()
         if provider == PROVIDER_BAI:
             # Never make a network request while rendering /auth. Reuse a warm
             # cache when available; the UI fetches the live catalog lazily.
             return list(_models_cache.get("models") or [])
+        if getattr(runtime, "is_dynamic_provider", lambda _provider: False)(provider):
+            return runtime.dynamic_provider_list_models(provider)
         return []
 
     def live_models(provider: str) -> list[str]:
@@ -559,6 +691,10 @@ def install(runtime: Any) -> None:
             return runtime.notion_list_models()
         if provider == PROVIDER_NIM:
             return runtime.nim_list_models()
+        if provider == PROVIDER_GENERIC:
+            return runtime.generic_list_models()
+        if getattr(runtime, "is_dynamic_provider", lambda _provider: False)(provider):
+            return runtime.dynamic_provider_list_models(provider)
         return []
 
     def providers(request: Request) -> dict[str, Any]:
@@ -569,20 +705,36 @@ def install(runtime: Any) -> None:
             "active_provider": active_provider,
             "active_model": get_active_model(runtime),
             "providers": [
-                {
-                    "id": provider,
-                    "label": PROVIDER_LABELS[provider],
-                    "configured": provider_configured(provider),
-                    "models": fallback_models(provider),
-                }
-                for provider in KNOWN_PROVIDERS
+                *[
+                    {
+                        "id": provider,
+                        "label": PROVIDER_LABELS[provider],
+                        "configured": provider_configured(provider),
+                        "models": fallback_models(provider),
+                        "kind": "builtin",
+                        "editable": False,
+                    }
+                    for provider in KNOWN_PROVIDERS
+                ],
+                *[
+                    {
+                        "id": item["id"],
+                        "label": item["name"],
+                        "configured": item["configured"],
+                        "models": [item["model"]] if item.get("model") else [],
+                        "kind": "custom",
+                        "editable": True,
+                        "base_url": item["base_url"],
+                    }
+                    for item in runtime.list_dynamic_providers()
+                ],
             ],
         }
 
     def provider_models(request: Request, provider: str) -> dict[str, Any]:
         """Fetch one provider catalog on demand after the admin UI is visible."""
         runtime.require_admin(request)
-        if provider not in KNOWN_PROVIDERS:
+        if not provider_exists(runtime, provider):
             raise HTTPException(status_code=404, detail=f"Unsupported provider: {provider}.")
         configured = provider_configured(provider)
         fallback = fallback_models(provider)
@@ -619,8 +771,8 @@ def install(runtime: Any) -> None:
         runtime.require_admin(request)
         label = str(payload.get("label") or "Client").strip()[:100] or "Client"
         provider = payload.get("provider")
-        if provider not in KNOWN_PROVIDERS:
-            raise HTTPException(status_code=400, detail=f"provider must be one of: {', '.join(KNOWN_PROVIDERS)}.")
+        if not isinstance(provider, str) or not provider_exists(runtime, provider):
+            raise HTTPException(status_code=400, detail="provider is unknown or no longer exists.")
         model = str(payload.get("model") or "").strip()[:200]
         key = str(payload.get("key") or "").strip()
         if not key:
@@ -642,6 +794,21 @@ def install(runtime: Any) -> None:
     runtime.app.add_api_route("/auth/clients", create_client, methods=["POST"])
     runtime.app.add_api_route("/auth/clients/{client_id}", update_client, methods=["POST"])
     runtime.app.add_api_route("/auth/clients/{client_id}", delete_client, methods=["DELETE"])
+
+    def delete_custom_provider(request: Request, provider_id: str) -> dict[str, Any]:
+        runtime.require_admin(request)
+        if not getattr(runtime, "is_dynamic_provider", lambda _provider: False)(provider_id):
+            raise HTTPException(status_code=404, detail="Custom provider not found.")
+        if get_active_provider(runtime) == provider_id:
+            raise HTTPException(status_code=409, detail="Provider is currently selected globally. Switch provider before deleting it.")
+        usage = _client_provider_usage(runtime, provider_id)
+        if usage:
+            raise HTTPException(status_code=409, detail=f"Provider is assigned to {usage} client key(s). Reassign or delete those clients first.")
+        from faable.generic_provider import delete_dynamic_provider
+        delete_dynamic_provider(runtime, provider_id)
+        return {"ok": True, "data": runtime.list_dynamic_providers()}
+
+    runtime.app.add_api_route("/auth/custom-providers/{provider_id}", delete_custom_provider, methods=["DELETE"])
 
     # Mirror admin JSON endpoints under /admin-api. This gives deployments a
     # neutral management path when enterprise web filters aggressively classify
