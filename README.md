@@ -5,6 +5,12 @@ FastAPI gateway chạy trên **Faable**, kết nối ChatGPT/Codex upstream bằ
 
 > ChatGPT/Codex authentication và backend endpoint là private/internal interfaces và có thể thay đổi. Gateway không phải OpenAI Public API.
 
+### v0.5.4 · Admin secret reveal + Notion account health
+
+- Client key list không còn giải mã secret; full key chỉ được decrypt khi admin bấm **Xem/Copy** qua endpoint riêng có `Cache-Control: no-store`.
+- Notion accounts có health `Khỏe / Lỗi / Đã tắt`, nút kiểm tra session, bật/tắt và xóa hẳn account stale/disabled.
+- Provider health của Notion kiểm tra session thực với `getAvailableModels` và ghi lại lỗi gần nhất.
+
 ### v0.5.3 · ChatGPT routing + SSE overload recovery
 
 - Cô lập model ChatGPT khỏi model của custom/generic provider khi global route và client-key route khác nhau.
@@ -404,8 +410,10 @@ GET  /auth/nim/key             # {"configured": true}; catalog model tải lazy
 POST /auth/notion/login          # {"token_v2": "...", "notion_user_id": "...", "notion_users": "..."}
 POST /auth/notion/browser/start  # mở Chrome/Edge local và bắt đầu chờ login
 POST /auth/notion/browser/poll   # {"login_id": "..."}
-GET  /auth/notion/accounts       # danh sách tài khoản Notion
-DELETE /auth/notion/accounts/{id}
+GET    /auth/notion/accounts               # danh sách + health tài khoản Notion
+POST   /auth/notion/accounts/{id}              # {"status":"active"|"disabled"}
+POST   /auth/notion/accounts/{id}/health       # kiểm tra session ngay
+DELETE /auth/notion/accounts/{id}              # xóa hẳn; account khỏe đang active phải tắt trước
 ```
 
 OpenRouter, TokenRouter, NIM và `generic` nói chuẩn OpenAI nên `/v1/chat/completions` được passthrough nguyên bản (stream + non-stream, kể cả tool calling). `generic` cũng passthrough `/v1/responses` tới `${GENERIC_BASE_URL}/responses`; upstream nào không hỗ trợ Responses sẽ trả lỗi upstream bình thường. TokenRouter được passthrough native cho `/v1/responses` và `/v1/messages`; OpenRouter và NIM hiện vẫn trả 503 ở endpoint Responses. Với `/v1/messages`, `generic` dùng bridge Anthropic → OpenAI Chat Completions. Notion không có tool calling native — các message được gộp thành một prompt duy nhất và văn bản trả về được chuyển thành `chat.completion` chuẩn (stream qua bộ parse NDJSON của Notion).
@@ -434,13 +442,14 @@ Thẻ **Client Keys** trên trang admin cho phép tạo API key riêng cho từn
 API admin (yêu cầu đăng nhập admin):
 
 ```text
-GET    /auth/clients                 # danh sách client keys (key đã mask)
-POST   /auth/clients                 # {"label", "provider", "model", "key?"} — bỏ trống key để tự sinh (gwc-…)
-POST   /auth/clients/{id}            # {"provider"?, "model"?, "label"?, "status"?}
-DELETE /auth/clients/{id}            # xóa vĩnh viễn
+GET    /auth/clients                    # chỉ metadata + mask; không decrypt secret
+POST   /auth/clients                    # {"label", "provider", "model", "key?"} — bỏ trống key để tự sinh (gwc-…)
+GET    /auth/clients/{id}/secret        # decrypt on-demand khi admin bấm Xem/Copy; no-store
+POST   /auth/clients/{id}               # {"provider"?, "model"?, "label"?, "status"?}
+DELETE /auth/clients/{id}               # xóa vĩnh viễn
 ```
 
-Client keys được mã hóa Fernet trong bảng `gateway_api_keys` (kèm SHA-256 hash để tra cứu); key đầy đủ chỉ hiển thị một lần lúc tạo. Client key không model (để trống) sẽ dùng model chung của gateway.
+Client keys được mã hóa Fernet trong bảng `gateway_api_keys` (kèm SHA-256 hash để tra cứu). Danh sách client không giải mã key; full key chỉ được trả lúc tạo hoặc khi admin chủ động bấm **Xem/Copy**. Client key không model (để trống) sẽ dùng model chung của gateway.
 
 ## Account management
 
@@ -450,6 +459,7 @@ Các endpoint admin:
 POST   /auth/device/start
 POST   /auth/device/poll
 GET    /auth/accounts
+POST   /auth/accounts/{account_id}      # {"status":"active"|"disabled"}
 DELETE /auth/accounts/{account_id}
 ```
 
