@@ -10,6 +10,7 @@ import uuid
 from typing import Any
 
 from fastapi import Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 PROVIDER_CHATGPT = "chatgpt"
 PROVIDER_BAI = "bai"
@@ -449,13 +450,21 @@ def bai_list_models(runtime: Any) -> list[str]:
 
 
 def _client_rows(runtime: Any) -> list[dict[str, Any]]:
+    """Return client metadata without decrypting stored secrets.
+
+    Admin list views must never decrypt or serialize client keys. The full key is
+    exposed only through the dedicated secret endpoint after an explicit View/Copy
+    action. Existing rows do not have a plaintext hint column, so the list uses a
+    neutral mask rather than decrypting merely to recover the prefix/suffix.
+    """
+    masked = "••••••••••••••••"
     if not runtime.DATABASE_URL:
         entries = sorted(_memory_clients.values(), key=lambda entry: int(entry["created_at"]), reverse=True)
         return [
             {
                 "id": entry["id"],
                 "label": entry["label"],
-                "key_masked": mask_client_key(entry["key"]),
+                "key_masked": masked,
                 "provider": entry["provider"],
                 "model": entry["model"],
                 "status": entry["status"],
@@ -465,19 +474,36 @@ def _client_rows(runtime: Any) -> list[dict[str, Any]]:
     with runtime.db() as connection:
         _ensure_client_table(connection)
         rows = connection.execute(
-            "SELECT id, label, key_enc, provider, model, status FROM gateway_api_keys ORDER BY created_at DESC"
+            "SELECT id, label, provider, model, status FROM gateway_api_keys ORDER BY created_at DESC"
         ).fetchall()
     return [
         {
             "id": str(row[0]),
             "label": str(row[1]),
-            "key_masked": mask_client_key(runtime.decrypt_token(str(row[2]))),
-            "provider": str(row[3]),
-            "model": str(row[4] or ""),
-            "status": str(row[5]),
+            "key_masked": masked,
+            "provider": str(row[2]),
+            "model": str(row[3] or ""),
+            "status": str(row[4]),
         }
         for row in rows
     ]
+
+
+def _client_secret(runtime: Any, client_id: str) -> str:
+    if not runtime.DATABASE_URL:
+        entry = _memory_clients.get(client_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Client key not found.")
+        return str(entry["key"])
+    with runtime.db() as connection:
+        _ensure_client_table(connection)
+        row = connection.execute(
+            "SELECT key_enc FROM gateway_api_keys WHERE id=%s",
+            (client_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Client key not found.")
+    return runtime.decrypt_token(str(row[0]))
 
 
 def _create_client(runtime: Any, label: str, key: str, provider: str, model: str) -> str:
@@ -758,6 +784,49 @@ def install(runtime: Any) -> None:
             "source": "live" if models else "fallback",
         }
 
+    def provider_health(request: Request) -> dict[str, Any]:
+        runtime.require_admin(request)
+        now_ms = int(time.time() * 1000)
+        chatgpt_health = {"status": "error", "detail": "No active ChatGPT account"}
+        if runtime.DATABASE_URL:
+            try:
+                with runtime.db() as connection:
+                    row = connection.execute(
+                        "SELECT COUNT(*), COALESCE(MAX(expires_at),0) FROM chatgpt_accounts WHERE status='active'"
+                    ).fetchone()
+                count = int(row[0]) if row else 0
+                latest_expiry = int(row[1]) if row else 0
+                if count and latest_expiry > now_ms:
+                    chatgpt_health = {"status": "ok", "detail": f"{count} active account(s)"}
+                elif count:
+                    chatgpt_health = {"status": "degraded", "detail": "Active account token is expired; refresh will be attempted on use"}
+            except Exception as error:
+                chatgpt_health = {"status": "error", "detail": str(error)[:160]}
+        elif getattr(runtime, "CHATGPT_ACCESS_TOKEN", "") and getattr(runtime, "CHATGPT_ACCOUNT_ID", ""):
+            chatgpt_health = {"status": "ok", "detail": "Configured from environment"}
+
+        result = []
+        all_providers = list(KNOWN_PROVIDERS) + [item["id"] for item in runtime.list_dynamic_providers()]
+        for provider in all_providers:
+            if provider == PROVIDER_CHATGPT:
+                health = chatgpt_health
+            elif not provider_configured(provider):
+                health = {"status": "unconfigured", "detail": "Not configured"}
+            else:
+                try:
+                    if provider == PROVIDER_NOTION and hasattr(runtime, "notion_provider_health"):
+                        health = runtime.notion_provider_health()
+                    else:
+                        models = live_models(provider)
+                        if provider in (PROVIDER_GENERIC,) or getattr(runtime, "is_dynamic_provider", lambda _provider: False)(provider):
+                            health = {"status": "ok", "detail": "Configured"}
+                        else:
+                            health = {"status": "ok" if models else "degraded", "detail": f"{len(models)} model(s) available" if models else "Configured, but catalog check returned no models"}
+                except Exception as error:
+                    health = {"status": "error", "detail": str(error)[:160]}
+            result.append({"id": provider, **health})
+        return {"data": result, "checked_at": now_ms}
+
     def select_provider(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
         runtime.require_admin(request)
         provider = payload.get("provider")
@@ -771,6 +840,7 @@ def install(runtime: Any) -> None:
     runtime.app.add_api_route("/models", models_endpoint, methods=["GET"], include_in_schema=False)
     runtime.app.add_api_route("/auth/providers", providers, methods=["GET"])
     runtime.app.add_api_route("/auth/providers/{provider}/models", provider_models, methods=["GET"])
+    runtime.app.add_api_route("/auth/providers/health", provider_health, methods=["GET"])
     runtime.app.add_api_route("/auth/providers/select", select_provider, methods=["POST"])
 
     def list_clients(request: Request) -> dict[str, Any]:
@@ -790,6 +860,13 @@ def install(runtime: Any) -> None:
         client_id = _create_client(runtime, label, key, provider, model)
         return {"ok": True, "id": client_id, "key": key, "data": _client_rows(runtime)}
 
+    def client_secret(request: Request, client_id: str) -> JSONResponse:
+        runtime.require_admin(request)
+        return JSONResponse(
+            {"id": client_id, "key": _client_secret(runtime, client_id)},
+            headers={"Cache-Control": "no-store"},
+        )
+
     def update_client(request: Request, client_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         runtime.require_admin(request)
         _update_client(runtime, client_id, payload)
@@ -802,6 +879,7 @@ def install(runtime: Any) -> None:
 
     runtime.app.add_api_route("/auth/clients", list_clients, methods=["GET"])
     runtime.app.add_api_route("/auth/clients", create_client, methods=["POST"])
+    runtime.app.add_api_route("/auth/clients/{client_id}/secret", client_secret, methods=["GET"])
     runtime.app.add_api_route("/auth/clients/{client_id}", update_client, methods=["POST"])
     runtime.app.add_api_route("/auth/clients/{client_id}", delete_client, methods=["DELETE"])
 

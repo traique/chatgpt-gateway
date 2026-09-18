@@ -36,7 +36,7 @@ CODEX_REFERER = "https://chatgpt.com/"
 CODEX_USER_AGENT = "codex_cli_rs/0.144.1"
 DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
 
-app = FastAPI(title="chatgpt-gateway", version="0.5.3", docs_url=None, redoc_url=None)
+app = FastAPI(title="chatgpt-gateway", version="0.5.4", docs_url=None, redoc_url=None)
 if SESSION_SECRET:
     app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, max_age=43200, same_site="lax", https_only=True)
 
@@ -179,7 +179,11 @@ def refresh_account(row: tuple[Any, ...]) -> tuple[str, str]:
         timeout=30,
     )
     if not response.ok:
-        raise HTTPException(status_code=502, detail=f"ChatGPT token refresh failed: HTTP {response.status_code}.")
+        message = f"ChatGPT token refresh failed: HTTP {response.status_code}."
+        if DATABASE_URL:
+            with db() as connection:
+                connection.execute("UPDATE chatgpt_accounts SET last_error=%s, updated_at=%s WHERE id=%s", (message, int(time.time() * 1000), row[0]))
+        raise HTTPException(status_code=502, detail=message)
     payload = response.json()
     access_token = payload.get("access_token")
     if not isinstance(access_token, str) or not access_token:
@@ -366,16 +370,53 @@ def accounts(request: Request) -> dict[str, Any]:
     require_admin(request)
     database_required()
     with db() as connection:
-        rows = connection.execute("SELECT id,label,account_id,status,expires_at FROM chatgpt_accounts ORDER BY created_at DESC").fetchall()
-    return {"data": [{"id": str(row[0]), "label": str(row[1]), "account_id": str(row[2]), "status": str(row[3]), "expires_at": int(row[4])} for row in rows]}
+        rows = connection.execute("SELECT id,label,account_id,status,expires_at,last_error,updated_at FROM chatgpt_accounts ORDER BY created_at DESC").fetchall()
+    now = int(time.time() * 1000)
+    data = []
+    for row in rows:
+        expires_at = int(row[4])
+        status_value = str(row[3])
+        last_error = str(row[5] or "")
+        if status_value != "active":
+            health = "disabled"
+        elif last_error:
+            health = "error"
+        elif expires_at <= now:
+            health = "expired"
+        elif expires_at <= now + 15 * 60 * 1000:
+            health = "expiring"
+        else:
+            health = "healthy"
+        data.append({"id": str(row[0]), "label": str(row[1]), "account_id": str(row[2]), "status": status_value, "expires_at": expires_at, "health": health, "last_error": last_error, "updated_at": int(row[6])})
+    return {"data": data}
+
+
+@app.post("/auth/accounts/{account_id}")
+def update_account(account_id: str, request: Request, payload: dict[str, Any]) -> dict[str, bool]:
+    require_admin(request)
+    database_required()
+    status_value = str(payload.get("status") or "")
+    if status_value not in {"active", "disabled"}:
+        raise HTTPException(status_code=400, detail="status must be active or disabled.")
+    with db() as connection:
+        result = connection.execute("UPDATE chatgpt_accounts SET status=%s, updated_at=%s WHERE id=%s", (status_value, int(time.time() * 1000), account_id))
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="ChatGPT account not found.")
+    return {"ok": True}
 
 
 @app.delete("/auth/accounts/{account_id}")
-def disable_account(account_id: str, request: Request) -> dict[str, bool]:
+def delete_account(account_id: str, request: Request) -> dict[str, bool]:
     require_admin(request)
     database_required()
+    now = int(time.time() * 1000)
     with db() as connection:
-        connection.execute("UPDATE chatgpt_accounts SET status='disabled', updated_at=%s WHERE id=%s", (int(time.time() * 1000), account_id))
+        row = connection.execute("SELECT status, expires_at FROM chatgpt_accounts WHERE id=%s", (account_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="ChatGPT account not found.")
+        if str(row[0]) == "active" and int(row[1]) > now:
+            raise HTTPException(status_code=409, detail="Disable this active account before deleting it.")
+        connection.execute("DELETE FROM chatgpt_accounts WHERE id=%s", (account_id,))
     return {"ok": True}
 
 

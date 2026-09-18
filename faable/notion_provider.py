@@ -137,7 +137,12 @@ def notion_list_models(runtime: Any) -> list[str]:
             timeout=6,
         )
         payload = response.json() if response.status_code == 200 else None
-    except Exception:
+        if response.status_code == 200 and isinstance(payload, dict):
+            _mark_notion_account_health(runtime, str(account["id"]), "")
+        else:
+            _mark_notion_account_health(runtime, str(account["id"]), f"Notion model check failed: HTTP {response.status_code}.")
+    except Exception as error:
+        _mark_notion_account_health(runtime, str(account["id"]), f"Notion model check failed: {error}")
         payload = None
     if not isinstance(payload, dict):
         return cached or list(NOTION_MODEL_CATALOG)
@@ -553,12 +558,14 @@ def _ensure_notion_table(connection: Any) -> None:
             "id TEXT PRIMARY KEY, label TEXT NOT NULL, cookie_enc TEXT NOT NULL, "
             "user_id TEXT NOT NULL, space_id TEXT NOT NULL, space_name TEXT NOT NULL DEFAULT '', "
             "user_agent_enc TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active', "
+            "last_error TEXT NOT NULL DEFAULT '', last_checked_at BIGINT NOT NULL DEFAULT 0, "
             "created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)"
         )
-        # Existing deployments predate the browser user-agent column. Keeping
-        # the captured UA alongside the cookie prevents a browser session from
-        # being replayed with an invented, mismatched fingerprint after restart.
+        # Existing deployments predate these admin-health columns. They are kept
+        # local to the gateway and contain no additional Notion secret material.
         connection.execute("ALTER TABLE notion_accounts ADD COLUMN IF NOT EXISTS user_agent_enc TEXT NOT NULL DEFAULT ''")
+        connection.execute("ALTER TABLE notion_accounts ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT ''")
+        connection.execute("ALTER TABLE notion_accounts ADD COLUMN IF NOT EXISTS last_checked_at BIGINT NOT NULL DEFAULT 0")
         _notion_table_ready = True
 
 
@@ -571,7 +578,7 @@ def _active_notion_row(runtime: Any) -> dict[str, Any] | None:
     with runtime.db() as connection:
         _ensure_notion_table(connection)
         row = connection.execute(
-            "SELECT id, label, cookie_enc, user_id, space_id, space_name, user_agent_enc FROM notion_accounts "
+            "SELECT id, label, cookie_enc, user_id, space_id, space_name, user_agent_enc, last_error, last_checked_at FROM notion_accounts "
             "WHERE status='active' ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
     if not row:
@@ -584,6 +591,8 @@ def _active_notion_row(runtime: Any) -> dict[str, Any] | None:
         "space_id": str(row[4]),
         "space_name": str(row[5] or ""),
         "user_agent_enc": str(row[6] or ""),
+        "last_error": str(row[7] or ""),
+        "last_checked_at": int(row[8] or 0),
     }
 
 
@@ -591,25 +600,7 @@ def get_active_notion_account(runtime: Any) -> dict[str, Any]:
     row = _active_notion_row(runtime)
     if not row:
         raise HTTPException(status_code=503, detail="No active Notion account. Open /auth and add token_v2 first.")
-    stored = row["cookie_enc"]
-    if runtime.DATABASE_URL:
-        stored = runtime.decrypt_token(stored)
-    stored_user_agent = str(row.get("user_agent_enc") or "")
-    if runtime.DATABASE_URL and stored_user_agent:
-        stored_user_agent = runtime.decrypt_token(stored_user_agent)
-    # Backward compatible with rows that store either token_v2 only or a minimal browser session cookie.
-    parsed = parse_browser_cookie(stored) if "=" in stored else {}
-    token_v2 = normalize_token_v2(parsed.get("token_v2") or stored)
-    return {
-        **row,
-        "full_cookie": stored if parsed else "",
-        "token_v2": token_v2,
-        "browser_id": parsed.get("notion_browser_id", ""),
-        "device_id": parsed.get("device_id", ""),
-        "user_id": row.get("user_id") or parsed.get("notion_user_id", ""),
-        "notion_users": parsed.get("notion_users", ""),
-        "user_agent": stored_user_agent or DEFAULT_NOTION_USER_AGENT,
-    }
+    return _decode_notion_account(runtime, row)
 
 
 def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> str:
@@ -636,6 +627,8 @@ def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> st
             "space_name": account.get("space_name", ""),
             "user_agent_enc": encrypted_user_agent,
             "status": "active",
+            "last_error": "",
+            "last_checked_at": now,
             "created_at": now,
             "updated_at": now,
         }
@@ -647,9 +640,9 @@ def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> st
             (now,),
         )
         connection.execute(
-            "INSERT INTO notion_accounts (id, label, cookie_enc, user_id, space_id, space_name, user_agent_enc, status, created_at, updated_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)",
-            (account_id, label, encrypted, account["user_id"], account["space_id"], account.get("space_name", ""), encrypted_user_agent, now, now),
+            "INSERT INTO notion_accounts (id, label, cookie_enc, user_id, space_id, space_name, user_agent_enc, status, last_error, last_checked_at, created_at, updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,'active','',%s,%s,%s)",
+            (account_id, label, encrypted, account["user_id"], account["space_id"], account.get("space_name", ""), encrypted_user_agent, now, now, now),
         )
     return account_id
 
@@ -657,34 +650,168 @@ def save_notion_account(runtime: Any, label: str, account: dict[str, Any]) -> st
 def notion_account_rows(runtime: Any) -> list[dict[str, Any]]:
     if not runtime.DATABASE_URL:
         entries = sorted(_memory_notion_accounts.values(), key=lambda entry: int(entry["created_at"]), reverse=True)
-        return [
+        rows = [
             {"id": entry["id"], "label": entry["label"], "user_id": entry["user_id"],
-             "space_id": entry["space_id"], "space_name": entry.get("space_name", ""), "status": entry["status"]}
+             "space_id": entry["space_id"], "space_name": entry.get("space_name", ""), "status": entry["status"],
+             "last_error": str(entry.get("last_error") or ""), "last_checked_at": int(entry.get("last_checked_at") or 0)}
             for entry in entries
         ]
+    else:
+        with runtime.db() as connection:
+            _ensure_notion_table(connection)
+            db_rows = connection.execute(
+                "SELECT id, label, user_id, space_id, space_name, status, last_error, last_checked_at "
+                "FROM notion_accounts ORDER BY created_at DESC"
+            ).fetchall()
+        rows = [
+            {"id": str(row[0]), "label": str(row[1]), "user_id": str(row[2]),
+             "space_id": str(row[3]), "space_name": str(row[4] or ""), "status": str(row[5]),
+             "last_error": str(row[6] or ""), "last_checked_at": int(row[7] or 0)}
+            for row in db_rows
+        ]
+    for row in rows:
+        row["health"] = "disabled" if row["status"] != "active" else ("error" if row["last_error"] else "healthy")
+    return rows
+
+
+def _mark_notion_account_health(runtime: Any, account_id: str, error: str = "") -> None:
+    now = int(time.time() * 1000)
+    message = str(error or "")[:1000]
+    if not runtime.DATABASE_URL:
+        entry = _memory_notion_accounts.get(account_id)
+        if entry:
+            entry["last_error"] = message
+            entry["last_checked_at"] = now
+            entry["updated_at"] = now
+        return
     with runtime.db() as connection:
         _ensure_notion_table(connection)
-        rows = connection.execute(
-            "SELECT id, label, user_id, space_id, space_name, status FROM notion_accounts ORDER BY created_at DESC"
-        ).fetchall()
-    return [
-        {"id": str(row[0]), "label": str(row[1]), "user_id": str(row[2]),
-         "space_id": str(row[3]), "space_name": str(row[4] or ""), "status": str(row[5])}
-        for row in rows
-    ]
+        connection.execute(
+            "UPDATE notion_accounts SET last_error=%s,last_checked_at=%s,updated_at=%s WHERE id=%s",
+            (message, now, now, account_id),
+        )
 
 
-def disable_notion_account(runtime: Any, account_id: str) -> None:
+def _notion_account_by_id(runtime: Any, account_id: str) -> dict[str, Any] | None:
+    if not runtime.DATABASE_URL:
+        entry = _memory_notion_accounts.get(account_id)
+        return dict(entry) if entry else None
+    with runtime.db() as connection:
+        _ensure_notion_table(connection)
+        row = connection.execute(
+            "SELECT id,label,cookie_enc,user_id,space_id,space_name,user_agent_enc,status,last_error,last_checked_at "
+            "FROM notion_accounts WHERE id=%s",
+            (account_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": str(row[0]), "label": str(row[1]), "cookie_enc": str(row[2]), "user_id": str(row[3]),
+        "space_id": str(row[4]), "space_name": str(row[5] or ""), "user_agent_enc": str(row[6] or ""),
+        "status": str(row[7]), "last_error": str(row[8] or ""), "last_checked_at": int(row[9] or 0),
+    }
+
+
+def _decode_notion_account(runtime: Any, row: dict[str, Any]) -> dict[str, Any]:
+    stored = str(row.get("cookie_enc") or "")
+    if runtime.DATABASE_URL:
+        stored = runtime.decrypt_token(stored)
+    stored_user_agent = str(row.get("user_agent_enc") or "")
+    if runtime.DATABASE_URL and stored_user_agent:
+        stored_user_agent = runtime.decrypt_token(stored_user_agent)
+    parsed = parse_browser_cookie(stored) if "=" in stored else {}
+    return {
+        **row,
+        "full_cookie": stored if parsed else "",
+        "token_v2": normalize_token_v2(parsed.get("token_v2") or stored),
+        "browser_id": parsed.get("notion_browser_id", ""),
+        "device_id": parsed.get("device_id", ""),
+        "user_id": row.get("user_id") or parsed.get("notion_user_id", ""),
+        "notion_users": parsed.get("notion_users", ""),
+        "user_agent": stored_user_agent or DEFAULT_NOTION_USER_AGENT,
+    }
+
+
+def check_notion_account_health(runtime: Any, account_id: str) -> dict[str, Any]:
+    row = _notion_account_by_id(runtime, account_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Notion account not found.")
+    account = _decode_notion_account(runtime, row)
+    headers = notion_request_headers(account, accept="application/json")
+    try:
+        response = runtime.requests.post(
+            f"{NOTION_API_BASE}/getAvailableModels",
+            headers=headers,
+            json={"spaceId": account["space_id"]},
+            impersonate=NOTION_IMPERSONATE,
+            timeout=6,
+        )
+        if response.status_code != 200:
+            message = f"Notion session check failed: HTTP {response.status_code}."
+            _mark_notion_account_health(runtime, account_id, message)
+            return {"status": "error", "detail": message}
+        payload = response.json()
+        if not isinstance(payload, dict):
+            message = "Notion session check returned an invalid response."
+            _mark_notion_account_health(runtime, account_id, message)
+            return {"status": "error", "detail": message}
+    except Exception as error:
+        message = f"Notion session check failed: {error}"[:1000]
+        _mark_notion_account_health(runtime, account_id, message)
+        return {"status": "error", "detail": message}
+    _mark_notion_account_health(runtime, account_id, "")
+    return {"status": "ok", "detail": "Notion session is valid"}
+
+
+def notion_provider_health(runtime: Any) -> dict[str, Any]:
+    row = _active_notion_row(runtime)
+    if not row:
+        return {"status": "unconfigured", "detail": "No active Notion account"}
+    return check_notion_account_health(runtime, str(row["id"]))
+
+
+def set_notion_account_status(runtime: Any, account_id: str, status: str) -> None:
+    if status not in {"active", "disabled"}:
+        raise HTTPException(status_code=400, detail="status must be active or disabled.")
+    now = int(time.time() * 1000)
     if not runtime.DATABASE_URL:
         entry = _memory_notion_accounts.get(account_id)
         if not entry:
             raise HTTPException(status_code=404, detail="Notion account not found.")
-        entry["status"] = "disabled"
+        if status == "active":
+            for other in _memory_notion_accounts.values():
+                if other["id"] != account_id and other["status"] == "active":
+                    other["status"] = "disabled"
+                    other["updated_at"] = now
+        entry["status"] = status
+        entry["updated_at"] = now
         return
     with runtime.db() as connection:
         _ensure_notion_table(connection)
-        if connection.execute("UPDATE notion_accounts SET status='disabled', updated_at=%s WHERE id=%s", (int(time.time() * 1000), account_id)).rowcount == 0:
+        if not connection.execute("SELECT 1 FROM notion_accounts WHERE id=%s", (account_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Notion account not found.")
+        if status == "active":
+            connection.execute("UPDATE notion_accounts SET status='disabled',updated_at=%s WHERE status='active' AND id<>%s", (now, account_id))
+        connection.execute("UPDATE notion_accounts SET status=%s,updated_at=%s WHERE id=%s", (status, now, account_id))
+
+
+def delete_notion_account(runtime: Any, account_id: str) -> None:
+    if not runtime.DATABASE_URL:
+        entry = _memory_notion_accounts.get(account_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Notion account not found.")
+        if entry.get("status") == "active" and not entry.get("last_error"):
+            raise HTTPException(status_code=409, detail="Disable this healthy active Notion account before deleting it.")
+        del _memory_notion_accounts[account_id]
+        return
+    with runtime.db() as connection:
+        _ensure_notion_table(connection)
+        row = connection.execute("SELECT status,last_error FROM notion_accounts WHERE id=%s", (account_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Notion account not found.")
+        if str(row[0]) == "active" and not str(row[1] or ""):
+            raise HTTPException(status_code=409, detail="Disable this healthy active Notion account before deleting it.")
+        connection.execute("DELETE FROM notion_accounts WHERE id=%s", (account_id,))
 
 
 def resolve_notion_model(model: str) -> str:
@@ -1041,15 +1168,22 @@ def notion_inference_request(runtime: Any, payload: dict[str, Any]) -> Any:
             stream=True,
         )
     except Exception as error:
-        raise HTTPException(status_code=502, detail=f"Notion transport failed: {error}") from error
+        message = f"Notion transport failed: {error}"
+        _mark_notion_account_health(runtime, str(account["id"]), message)
+        raise HTTPException(status_code=502, detail=message) from error
     if response.status_code >= 400:
         try:
             detail = response.text[:500]
         except Exception:
             detail = f"HTTP {response.status_code}"
         if response.status_code in (401, 403):
-            raise HTTPException(status_code=401, detail=f"Notion auth failed ({response.status_code}). Refresh the Notion cookie in /auth. {detail}")
-        raise HTTPException(status_code=502, detail=f"Notion API {response.status_code}: {detail}")
+            message = f"Notion auth failed ({response.status_code}). Refresh the Notion cookie in /auth. {detail}"
+            _mark_notion_account_health(runtime, str(account["id"]), message)
+            raise HTTPException(status_code=401, detail=message)
+        message = f"Notion API {response.status_code}: {detail}"
+        _mark_notion_account_health(runtime, str(account["id"]), message)
+        raise HTTPException(status_code=502, detail=message)
+    _mark_notion_account_health(runtime, str(account["id"]), "")
     return response
 
 
@@ -1176,6 +1310,7 @@ def install(runtime: Any) -> None:
     runtime.notion_request = lambda payload: notion_inference_request(runtime, payload)
     runtime.resolve_notion_model = resolve_notion_model
     runtime.notion_list_models = lambda: notion_list_models(runtime)
+    runtime.notion_provider_health = lambda: notion_provider_health(runtime)
 
     def notion_login(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
         runtime.require_admin(request)
@@ -1222,13 +1357,25 @@ def install(runtime: Any) -> None:
         runtime.require_admin(request)
         return {"data": notion_account_rows(runtime)}
 
-    def notion_disable(request: Request, account_id: str) -> dict[str, Any]:
+    def notion_account_update(request: Request, account_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         runtime.require_admin(request)
-        disable_notion_account(runtime, account_id)
+        set_notion_account_status(runtime, account_id, str(payload.get("status") or ""))
+        return {"ok": True, "data": notion_account_rows(runtime)}
+
+    def notion_account_check(request: Request, account_id: str) -> dict[str, Any]:
+        runtime.require_admin(request)
+        health = check_notion_account_health(runtime, account_id)
+        return {"ok": health["status"] == "ok", "health": health, "data": notion_account_rows(runtime)}
+
+    def notion_account_delete(request: Request, account_id: str) -> dict[str, Any]:
+        runtime.require_admin(request)
+        delete_notion_account(runtime, account_id)
         return {"ok": True, "data": notion_account_rows(runtime)}
 
     runtime.app.add_api_route("/auth/notion/login", notion_login, methods=["POST"])
     runtime.app.add_api_route("/auth/notion/browser/start", notion_browser_start, methods=["POST"])
     runtime.app.add_api_route("/auth/notion/browser/poll", notion_browser_poll, methods=["POST"])
     runtime.app.add_api_route("/auth/notion/accounts", notion_accounts, methods=["GET"])
-    runtime.app.add_api_route("/auth/notion/accounts/{account_id}", notion_disable, methods=["DELETE"])
+    runtime.app.add_api_route("/auth/notion/accounts/{account_id}", notion_account_update, methods=["POST"])
+    runtime.app.add_api_route("/auth/notion/accounts/{account_id}/health", notion_account_check, methods=["POST"])
+    runtime.app.add_api_route("/auth/notion/accounts/{account_id}", notion_account_delete, methods=["DELETE"])
