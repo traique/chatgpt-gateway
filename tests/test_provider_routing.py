@@ -308,8 +308,13 @@ def test_create_client_key_and_list_masked(monkeypatch) -> None:
     assert len(listed) == 1
     assert listed[0]["label"] == "Bot"
     assert listed[0]["provider"] == "bai"
-    assert listed[0]["key_masked"].endswith(key[-4:])
-    assert key not in listed[0]["key_masked"]
+    assert listed[0]["key_masked"] == "••••••••••••••••"
+    assert "key" not in listed[0]
+
+    revealed = client.get(f"/auth/clients/{listed[0]['id']}/secret")
+    assert revealed.status_code == 200
+    assert revealed.json()["key"] == key
+    assert revealed.headers["cache-control"] == "no-store"
 
 
 def test_client_key_routes_to_bai_while_global_stays_chatgpt(monkeypatch) -> None:
@@ -480,6 +485,7 @@ def test_admin_api_aliases_keep_all_methods() -> None:
     }
     assert ('/admin-api/clients', ('GET',)) in route_methods
     assert ('/admin-api/clients', ('POST',)) in route_methods
+    assert ('/admin-api/clients/{client_id}/secret', ('GET',)) in route_methods
     assert ('/admin-api/openrouter/key', ('GET',)) in route_methods
     assert ('/admin-api/openrouter/key', ('POST',)) in route_methods
     assert ('/admin-api/tokenrouter/key', ('GET',)) in route_methods

@@ -211,8 +211,62 @@ def test_notion_login_and_accounts(monkeypatch) -> None:
     accounts = client.get("/auth/notion/accounts").json()["data"]
     assert len(accounts) == 1
     assert accounts[0]["status"] == "active"
+    assert accounts[0]["health"] == "healthy"
     assert accounts[0]["space_id"] == "space-1"
     assert notion_provider.notion_configured(runtime) is True
+
+
+def test_notion_account_health_disable_enable_and_delete(monkeypatch) -> None:
+    client = _signin_notion(monkeypatch)
+    account_id = client.get("/auth/notion/accounts").json()["data"][0]["id"]
+
+    def fake_post(url, **kwargs):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"models": []}
+        return response
+
+    monkeypatch.setattr(runtime.requests, "post", fake_post)
+    health = client.post(f"/auth/notion/accounts/{account_id}/health")
+    assert health.status_code == 200
+    assert health.json()["health"]["status"] == "ok"
+
+    disabled = client.post(f"/auth/notion/accounts/{account_id}", json={"status": "disabled"})
+    assert disabled.status_code == 200
+    assert disabled.json()["data"][0]["health"] == "disabled"
+
+    enabled = client.post(f"/auth/notion/accounts/{account_id}", json={"status": "active"})
+    assert enabled.status_code == 200
+    assert enabled.json()["data"][0]["health"] == "healthy"
+
+    assert client.delete(f"/auth/notion/accounts/{account_id}").status_code == 409
+    client.post(f"/auth/notion/accounts/{account_id}", json={"status": "disabled"})
+    deleted = client.delete(f"/auth/notion/accounts/{account_id}")
+    assert deleted.status_code == 200
+    assert deleted.json()["data"] == []
+
+
+def test_notion_failed_health_is_visible_and_deletable(monkeypatch) -> None:
+    client = _signin_notion(monkeypatch)
+    account_id = client.get("/auth/notion/accounts").json()["data"][0]["id"]
+
+    def fake_post(url, **kwargs):
+        response = Mock()
+        response.status_code = 401
+        response.json.return_value = {}
+        return response
+
+    monkeypatch.setattr(runtime.requests, "post", fake_post)
+    checked = client.post(f"/auth/notion/accounts/{account_id}/health")
+    assert checked.status_code == 200
+    assert checked.json()["health"]["status"] == "error"
+    row = checked.json()["data"][0]
+    assert row["health"] == "error"
+    assert "HTTP 401" in row["last_error"]
+
+    deleted = client.delete(f"/auth/notion/accounts/{account_id}")
+    assert deleted.status_code == 200
+    assert deleted.json()["data"] == []
 
 def test_notion_chat_completions_non_stream(monkeypatch) -> None:
     _signin_notion(monkeypatch)
